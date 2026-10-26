@@ -1,8 +1,28 @@
 """
 Fuel Optimization Service.
-Uses 3D Spatial KD-Tree indexing and Dynamic Programming (DAG Shortest Path)
-to compute the most cost-effective sequence of fuel stops along a driving route.
-Guarantees vehicle never exceeds its 500-mile range while minimizing total fuel expenditure.
+
+Finds the cheapest way to buy fuel along a fixed driving route without the
+vehicle ever running dry (range <= max_range miles on a full tank).
+
+Model:
+    * The vehicle leaves the origin with an empty tank and fills up at a station
+      near the origin, so every gallon burned on the trip is paid for and the
+      reported stop costs add up exactly to the total cost.
+    * Fuel can be bought in any amount (not necessarily a full tank).
+    * Each stop carries a small penalty (fixed stop cost + fuel for the detour
+      off the highway). The penalty is only used to choose stops: it keeps the
+      plan from pulling over to save a few cents, and is not part of the
+      reported fuel cost.
+
+Algorithm (exact dynamic programming over stations x fuel-in-tank):
+    Stations within a corridor around the route are found with a 3D KD-tree
+    (one vectorized query of every station against the route polyline) and
+    sorted by route mile. Driving past a station is the same as stopping and
+    buying nothing, so the DP only moves from each station to the next one.
+    State = fuel in the tank on arrival, discretized to 0.1 gal. At each
+    station, "buy up to level g" is a prefix-minimum over arrival levels, so
+    one station costs O(L) numpy operations and the whole route O(n * L):
+    a few milliseconds for a 2,800-mile route with ~450 stations.
 """
 
 import os
@@ -17,12 +37,34 @@ logger = logging.getLogger(__name__)
 
 EARTH_RADIUS_MILES = 3958.8
 
+# Cost assigned to pulling over for fuel, used only when choosing stops.
+STOP_PENALTY_DOLLARS = 10.0
+# Stations this close to the start point are candidates for the first fill-up.
+ORIGIN_RADIUS_MILES = 25.0
+# Widest corridor tried before declaring a route infeasible.
+MAX_CORRIDOR_MILES = 35.0
+
 _STATION_CACHE = None
+
+
+class RouteInfeasibleError(ValueError):
+    """Raised when the route has a stretch longer than the vehicle range with no stations."""
+
+
+def _to_cartesian(lats, lons):
+    lat_rad = np.radians(lats)
+    lon_rad = np.radians(lons)
+    return np.column_stack((
+        EARTH_RADIUS_MILES * np.cos(lat_rad) * np.cos(lon_rad),
+        EARTH_RADIUS_MILES * np.cos(lat_rad) * np.sin(lon_rad),
+        EARTH_RADIUS_MILES * np.sin(lat_rad),
+    ))
+
 
 def _get_fuel_stations_index():
     """
     Loads geocoded fuel stations from data/fuel_stations_geocoded.csv
-    and constructs a 3D spatial KD-tree in memory (built once).
+    and constructs a 3D spatial KD-tree in memory (built once per process).
     """
     global _STATION_CACHE
     if _STATION_CACHE is not None:
@@ -34,21 +76,13 @@ def _get_fuel_stations_index():
         build_geocoded_fuel_dataset()
 
     df = pd.read_csv(csv_path)
-
-    # Convert coordinates to 3D Cartesian coordinates on sphere
-    lat_rad = np.radians(df['latitude'].values)
-    lon_rad = np.radians(df['longitude'].values)
-    x = EARTH_RADIUS_MILES * np.cos(lat_rad) * np.cos(lon_rad)
-    y = EARTH_RADIUS_MILES * np.cos(lat_rad) * np.sin(lon_rad)
-    z = EARTH_RADIUS_MILES * np.sin(lat_rad)
-    coords_3d = np.column_stack((x, y, z))
-
-    tree = cKDTree(coords_3d)
+    df['address'] = df['address'].fillna('')
+    coords_3d = _to_cartesian(df['latitude'].values, df['longitude'].values)
 
     _STATION_CACHE = {
         'df': df,
         'coords_3d': coords_3d,
-        'tree': tree
+        'tree': cKDTree(coords_3d),
     }
     logger.info(f"Loaded {len(df)} geocoded fuel stations into spatial index.")
     return _STATION_CACHE
@@ -64,6 +98,90 @@ def haversine_distances(lats, lons):
     return EARTH_RADIUS_MILES * c
 
 
+def _route_candidates(index_data, route_tree, route_cum_miles, corridor_miles, exclude):
+    """Returns stations within `corridor_miles` of the route, sorted by route mile."""
+    deviations, nearest_vertex = route_tree.query(
+        index_data['coords_3d'], distance_upper_bound=corridor_miles
+    )
+    mask = np.isfinite(deviations)
+    candidates = index_data['df'][mask].copy()
+    candidates['deviation_miles'] = deviations[mask]
+    candidates['route_mile'] = route_cum_miles[nearest_vertex[mask]]
+    candidates = candidates[~candidates.index.isin(exclude)]
+    return candidates.sort_values(['route_mile', 'retail_price'])
+
+
+def _origin_candidates(index_data, start_3d):
+    """Stations near the start point (or the single nearest one if none are close)."""
+    idx = index_data['tree'].query_ball_point(start_3d, r=ORIGIN_RADIUS_MILES)
+    if not idx:
+        idx = [int(index_data['tree'].query(start_3d)[1])]
+    origin = index_data['df'].iloc[idx].copy()
+    origin['deviation_miles'] = np.linalg.norm(index_data['coords_3d'][idx] - start_3d, axis=1)
+    origin['route_mile'] = 0.0
+    return origin
+
+
+def _find_largest_gap(miles):
+    gaps = np.diff(miles)
+    k = int(np.argmax(gaps))
+    return float(miles[k]), float(miles[k + 1]), float(gaps[k])
+
+
+def _plan_purchases(miles, prices, stop_penalties, max_range, mpg):
+    """
+    Minimum-cost purchase plan (fuel cost + stop penalties).
+
+    `miles` / `prices` / `stop_penalties` describe stations in route order; the
+    last entry is the destination (its price is ignored). The vehicle reaches
+    the first station with an empty tank. Returns a list of
+    (station_index, gallons_bought, fuel_on_arrival) tuples, or None if no
+    feasible plan exists.
+    """
+    tank = max_range / mpg
+    step = max(0.1, tank / 1000.0)
+    n_levels = int(round(tank / step)) + 1
+    levels = np.arange(n_levels) * step
+    level_idx = np.arange(n_levels)
+    # Cumulative fuel burned, in grid units; rounding the running total (not
+    # each leg) keeps the discretization error below half a step overall.
+    burn = np.round(np.asarray(miles) / mpg / step).astype(int)
+
+    dest = len(miles) - 1
+    value = np.full(n_levels, np.inf)
+    value[0] = 0.0
+    sources = []
+
+    for i in range(dest):
+        # Buy phase: best[g] = min(value[g], penalty + p*g + min_{f<=g}(value[f] - p*f))
+        adjusted = value - prices[i] * levels
+        prefix_min = np.minimum.accumulate(adjusted)
+        prefix_arg = np.maximum.accumulate(np.where(adjusted == prefix_min, level_idx, 0))
+        buy_value = prefix_min + prices[i] * levels + stop_penalties[i]
+        buy = buy_value < value
+        sources.append(np.where(buy, prefix_arg, level_idx))
+        after_buy = np.where(buy, buy_value, value)
+
+        # Drive phase: burn fuel to reach the next station
+        shift = burn[i + 1] - burn[i]
+        value = np.full(n_levels, np.inf)
+        if shift < n_levels:
+            value[:n_levels - shift] = after_buy[shift:]
+        if not np.isfinite(value).any():
+            return None
+
+    level = int(np.argmin(value))
+    plan = []
+    for i in range(dest - 1, -1, -1):
+        level += burn[i + 1] - burn[i]
+        arrival = int(sources[i][level])
+        if arrival != level:
+            plan.append((i, (level - arrival) * step, arrival * step))
+        level = arrival
+    plan.reverse()
+    return plan
+
+
 def optimize_fuel_route(route_coordinates, total_road_miles, max_range=500.0, mpg=10.0, max_deviation_miles=10.0):
     """
     Calculates the optimal fuel stops and total fuel cost for a given route.
@@ -73,299 +191,109 @@ def optimize_fuel_route(route_coordinates, total_road_miles, max_range=500.0, mp
         total_road_miles: total road distance in miles from OSRM
         max_range: maximum vehicle range on a single tank (default 500.0)
         mpg: miles per gallon fuel economy (default 10.0)
-        max_deviation_miles: max allowed distance of a fuel station off the highway route
+        max_deviation_miles: max allowed distance of a fuel station off the route.
+            Widened automatically (up to 35 mi) if the route has a gap longer than the range.
 
     Returns:
-        dict containing total_fuel_cost, total_gallons, fuel_stops list, etc.
-    """
-    t_start = time.time()
-    index_data = _get_fuel_stations_index()
-    stations_df = index_data['df']
-    station_coords_3d = index_data['coords_3d']
-    station_tree = index_data['tree']
+        dict containing total_fuel_cost, total_fuel_gallons, fuel_stops list, etc.
 
-    coords = np.array(route_coordinates)
+    Raises:
+        RouteInfeasibleError if no refueling plan exists with the available stations.
+    """
+    t_start = time.perf_counter()
+    index_data = _get_fuel_stations_index()
+
+    coords = np.asarray(route_coordinates, dtype=float)
     route_lons = coords[:, 0]
     route_lats = coords[:, 1]
 
-    # Compute cumulative haversine distance and scale to OSRM road distance
+    # Cumulative distance along the polyline, scaled to the router's road mileage
     seg_dists = np.zeros(len(coords))
-    seg_dists[1:] = haversine_distances(route_lats, route_lons)
+    if len(coords) > 1:
+        seg_dists[1:] = haversine_distances(route_lats, route_lons)
     haversine_cum = np.cumsum(seg_dists)
     hav_total = haversine_cum[-1] if haversine_cum[-1] > 0 else 1.0
+    route_cum_miles = haversine_cum * (total_road_miles / hav_total)
 
-    # Scaling factor to reconcile great-circle segments with road network mileage
-    scale_factor = total_road_miles / hav_total
-    route_cum_miles = haversine_cum * scale_factor
-
-    # Convert full route to 3D Cartesian coordinates
-    rx = EARTH_RADIUS_MILES * np.cos(np.radians(route_lats)) * np.cos(np.radians(route_lons))
-    ry = EARTH_RADIUS_MILES * np.cos(np.radians(route_lats)) * np.sin(np.radians(route_lons))
-    rz = EARTH_RADIUS_MILES * np.sin(np.radians(route_lats))
-    route_3d = np.column_stack((rx, ry, rz))
+    route_3d = _to_cartesian(route_lats, route_lons)
     route_tree = cKDTree(route_3d)
 
-    # 1. Spatial search: find candidate stations along route corridor
-    # Downsample route points to ~1000 sample points for high query speed
-    step = max(1, len(route_3d) // 1000)
-    sample_route_3d = route_3d[::step]
+    origin = _origin_candidates(index_data, route_3d[0])
 
-    # Search with adaptive corridor expansion if initial candidate count is low
-    corridor_search_r = max_deviation_miles
-    nearby_station_indices = set()
-    for pt_indices in station_tree.query_ball_point(sample_route_3d, r=corridor_search_r):
-        nearby_station_indices.update(pt_indices)
-
-    # If corridor is sparse (e.g. rural routes), expand up to 20 miles
-    if len(nearby_station_indices) < 5 and corridor_search_r < 20.0:
-        corridor_search_r = 20.0
-        for pt_indices in station_tree.query_ball_point(sample_route_3d, r=corridor_search_r):
-            nearby_station_indices.update(pt_indices)
-
-    candidate_indices = list(nearby_station_indices)
-    if candidate_indices:
-        candidates = stations_df.iloc[candidate_indices].copy()
-        cand_coords_3d = station_coords_3d[candidate_indices]
-        deviations, closest_route_indices = route_tree.query(cand_coords_3d)
-        candidates['route_mile'] = route_cum_miles[closest_route_indices]
-        candidates['deviation_miles'] = deviations
-        valid_candidates = candidates[candidates['deviation_miles'] <= corridor_search_r].sort_values('route_mile').reset_index(drop=True)
-    else:
-        valid_candidates = pd.DataFrame()
-
-    total_gallons = round(total_road_miles / mpg, 2)
-
-    # CASE A: Short route within vehicle single tank range (<= 500 miles)
-    if total_road_miles <= max_range:
-        # Check if there is a cheap station along the route if driver wants to refuel
-        if not valid_candidates.empty:
-            cheapest_station = valid_candidates.sort_values('retail_price').iloc[0]
-            avg_price = float(cheapest_station['retail_price'])
-        else:
-            avg_price = 3.25
-
-        total_cost = round(total_gallons * avg_price, 2)
-        return {
-            'total_distance_miles': total_road_miles,
-            'total_fuel_gallons': total_gallons,
-            'total_fuel_cost': total_cost,
-            'average_price_per_gallon': round(avg_price, 3),
-            'fuel_stops_count': 0,
-            'fuel_stops': [],
-            'mpg': mpg,
-            'max_vehicle_range_miles': max_range,
-            'note': f"The total route distance ({total_road_miles} mi) is within the vehicle's {max_range}-mile maximum range. No refueling stops are strictly required to complete the trip.",
-            'calculation_time_ms': round((time.time() - t_start) * 1000, 2)
-        }
-
-    # CASE B: Long route requiring multiple fuel stops (> 500 miles)
-    if valid_candidates.empty:
-        raise ValueError("No fuel stations found along the route within search corridor.")
-
-    # Build Directed Acyclic Graph (DAG) for Penalized DP
-    # Safe range leaves a small buffer so the driver never reaches 0% fuel on the highway
-    SAFE_RANGE = min(max_range, max_range - 10.0) # e.g. 490 miles
-
-    nodes = [{
-        'id': 0,
-        'opis_id': 0,
-        'name': 'START',
-        'address': 'Origin',
-        'city': '',
-        'state': '',
-        'mile': 0.0,
-        'price': float(valid_candidates['retail_price'].median()),
-        'latitude': float(route_lats[0]),
-        'longitude': float(route_lons[0]),
-        'deviation': 0.0
-    }]
-
-    for _, row in valid_candidates.iterrows():
-        nodes.append({
-            'id': len(nodes),
-            'opis_id': int(row['opis_id']),
-            'name': str(row['name']),
-            'address': str(row['address']) if pd.notna(row['address']) else '',
-            'city': str(row['city']),
-            'state': str(row['state']),
-            'mile': float(row['route_mile']),
-            'price': float(row['retail_price']),
-            'latitude': float(row['latitude']),
-            'longitude': float(row['longitude']),
-            'deviation': float(row['deviation_miles'])
-        })
-
-    nodes.append({
-        'id': len(nodes),
-        'opis_id': -1,
-        'name': 'FINISH',
-        'address': 'Destination',
-        'city': '',
-        'state': '',
-        'mile': float(total_road_miles),
-        'price': 0.0,
-        'latitude': float(route_lats[-1]),
-        'longitude': float(route_lons[-1]),
-        'deviation': 0.0
-    })
-
-    N = len(nodes)
-    dp = [float('inf')] * N
-    prev = [-1] * N
-    dp[0] = 0.0
-
-    # Stop penalty ($7.50) balances minimizing price while discouraging excessive, unnecessary stops
-    STOP_PENALTY = 7.50
-
-    for i in range(N):
-        if dp[i] == float('inf'):
-            continue
-        mile_i = nodes[i]['mile']
-        for j in range(i + 1, N):
-            dist = nodes[j]['mile'] - mile_i
-            if dist > SAFE_RANGE:
-                # If no node was reachable before SAFE_RANGE, allow up to max_range
-                if j == i + 1 and dist <= max_range:
-                    pass
-                else:
-                    break
-            if dist <= 0:
-                continue
-
-            # Price for fuel consumed on leg i -> j
-            if j == N - 1:
-                # Last leg to destination: fuel is purchased at station i
-                leg_price = nodes[i]['price']
-            else:
-                # Fuel for segment i -> j purchased at station j
-                leg_price = nodes[j]['price']
-
-            leg_fuel_cost = (dist / mpg) * leg_price
-            penalty = STOP_PENALTY if (j != N - 1 and i != 0) else 0.0
-            edge_cost = leg_fuel_cost + penalty
-
-            if dp[i] + edge_cost < dp[j]:
-                dp[j] = dp[i] + edge_cost
-                prev[j] = i
-
-    # If DP could not reach destination within SAFE_RANGE, retry with strict max_range
-    if prev[-1] == -1:
-        dp = [float('inf')] * N
-        prev = [-1] * N
-        dp[0] = 0.0
-        for i in range(N):
-            if dp[i] == float('inf'):
-                continue
-            mile_i = nodes[i]['mile']
-            for j in range(i + 1, N):
-                dist = nodes[j]['mile'] - mile_i
-                if dist > max_range:
-                    break
-                if dist <= 0:
-                    continue
-                leg_price = nodes[i]['price'] if j == N - 1 else nodes[j]['price']
-                leg_fuel_cost = (dist / mpg) * leg_price
-                if dp[i] + leg_fuel_cost < dp[j]:
-                    dp[j] = dp[i] + leg_fuel_cost
-                    prev[j] = i
-
-    if prev[-1] == -1:
-        if max_deviation_miles < 35.0:
-            logger.info(f"Route had gap exceeding range with {max_deviation_miles} mi corridor. Expanding corridor...")
-            return optimize_fuel_route(
-                route_coordinates=route_coordinates,
-                total_road_miles=total_road_miles,
-                max_range=max_range,
-                mpg=mpg,
-                max_deviation_miles=max_deviation_miles + 15.0
+    corridor = max_deviation_miles
+    while True:
+        en_route = _route_candidates(index_data, route_tree, route_cum_miles, corridor, origin.index)
+        miles = np.concatenate((
+            origin['route_mile'].values, en_route['route_mile'].values, [total_road_miles]
+        ))
+        gap_start, gap_end, gap = _find_largest_gap(miles)
+        if gap <= max_range:
+            break
+        if corridor >= MAX_CORRIDOR_MILES:
+            raise RouteInfeasibleError(
+                f"No refueling plan is possible: the fuel price list has no stations between "
+                f"mile {gap_start:.0f} and mile {gap_end:.0f} of this route ({gap:.0f} miles), "
+                f"which is more than the vehicle's {max_range:.0f}-mile range."
             )
-        raise ValueError(
-            f"Unable to find a valid refueling path. The route contains a stretch exceeding {max_range} miles "
-            "without any accessible fuel stops within the search corridor."
+        corridor = min(MAX_CORRIDOR_MILES, corridor + 12.5)
+        logger.info(f"Route gap of {gap:.0f} mi exceeds range; widening corridor to {corridor} mi")
+
+    stations = pd.concat([origin, en_route])
+    station_prices = stations['retail_price'].values
+    detour_fuel_cost = 2.0 * stations['deviation_miles'].values / mpg * station_prices
+    prices = np.append(station_prices, 0.0)
+    stop_penalties = np.append(STOP_PENALTY_DOLLARS + detour_fuel_cost, 0.0)
+
+    plan = _plan_purchases(miles, prices, stop_penalties, max_range, mpg)
+    if plan is None:
+        raise RouteInfeasibleError(
+            f"No refueling plan keeps every leg within the vehicle's {max_range:.0f}-mile range."
         )
 
-    # Reconstruct optimal path
-    path = []
-    curr = N - 1
-    while curr != -1:
-        path.append(curr)
-        curr = prev[curr]
-    path.reverse()
-
-    # Build fuel stops response list and calculate exact leg costs
     fuel_stops = []
-    total_fuel_cost = 0.0
-    accumulated_gallons = 0.0
+    total_cost = 0.0
+    total_gallons = 0.0
+    prev_mile = 0.0
+    for node, gallons, arrival_fuel in plan:
+        station = stations.iloc[node]
+        price = float(station['retail_price'])
+        gallons = round(gallons, 2)
+        cost = round(gallons * price, 2)
+        total_cost += cost
+        total_gallons += gallons
+        fuel_stops.append({
+            'stop_number': len(fuel_stops) + 1,
+            'stop_type': 'origin' if node < len(origin) else 'en_route',
+            'opis_id': int(station['opis_id']),
+            'name': str(station['name']),
+            'address': str(station['address']),
+            'city': str(station['city']),
+            'state': str(station['state']),
+            'retail_price': round(price, 3),
+            'route_mile': round(float(miles[node]), 1),
+            'leg_distance_miles': round(float(miles[node]) - prev_mile, 1),
+            'fuel_on_arrival_gallons': round(arrival_fuel, 2),
+            'gallons_pumped': gallons,
+            'cost_at_stop': cost,
+            'miles_off_route': round(float(station['deviation_miles']), 2),
+            'latitude': float(station['latitude']),
+            'longitude': float(station['longitude']),
+        })
+        prev_mile = float(miles[node])
 
-    for k in range(len(path) - 1):
-        u_idx = path[k]
-        v_idx = path[k + 1]
-        u = nodes[u_idx]
-        v = nodes[v_idx]
-
-        leg_dist = round(v['mile'] - u['mile'], 2)
-        leg_gallons = round(leg_dist / mpg, 2)
-        accumulated_gallons += leg_gallons
-
-        if v_idx == N - 1:
-            # Final leg to destination: fuel bought at stop u
-            leg_price = u['price']
-            leg_cost = round(leg_gallons * leg_price, 2)
-            total_fuel_cost += leg_cost
-        elif u_idx == 0:
-            # First leg from start: refueled at stop v
-            leg_price = v['price']
-            leg_cost = round(leg_gallons * leg_price, 2)
-            total_fuel_cost += leg_cost
-            fuel_stops.append({
-                'stop_number': len(fuel_stops) + 1,
-                'opis_id': v['opis_id'],
-                'name': v['name'],
-                'address': v['address'],
-                'city': v['city'],
-                'state': v['state'],
-                'retail_price': round(v['price'], 3),
-                'route_mile': round(v['mile'], 1),
-                'leg_distance_miles': leg_dist,
-                'gallons_pumped': leg_gallons,
-                'cost_at_stop': leg_cost,
-                'miles_off_route': round(v['deviation'], 2),
-                'latitude': v['latitude'],
-                'longitude': v['longitude']
-            })
-        else:
-            # Intermediate leg: refueled at stop v
-            leg_price = v['price']
-            leg_cost = round(leg_gallons * leg_price, 2)
-            total_fuel_cost += leg_cost
-            fuel_stops.append({
-                'stop_number': len(fuel_stops) + 1,
-                'opis_id': v['opis_id'],
-                'name': v['name'],
-                'address': v['address'],
-                'city': v['city'],
-                'state': v['state'],
-                'retail_price': round(v['price'], 3),
-                'route_mile': round(v['mile'], 1),
-                'leg_distance_miles': leg_dist,
-                'gallons_pumped': leg_gallons,
-                'cost_at_stop': leg_cost,
-                'miles_off_route': round(v['deviation'], 2),
-                'latitude': v['latitude'],
-                'longitude': v['longitude']
-            })
-
-    total_fuel_cost = round(total_fuel_cost, 2)
-    avg_price = round(total_fuel_cost / total_gallons, 3) if total_gallons > 0 else 0.0
-
+    total_cost = round(total_cost, 2)
+    total_gallons = round(total_gallons, 2)
     return {
         'total_distance_miles': total_road_miles,
         'total_fuel_gallons': total_gallons,
-        'total_fuel_cost': total_fuel_cost,
-        'average_price_per_gallon': avg_price,
+        'total_fuel_cost': total_cost,
+        'average_price_per_gallon': round(total_cost / total_gallons, 3) if total_gallons else 0.0,
         'fuel_stops_count': len(fuel_stops),
         'fuel_stops': fuel_stops,
+        'final_leg_miles': round(total_road_miles - prev_mile, 1),
+        'stations_considered': len(stations),
+        'search_corridor_miles': corridor,
         'mpg': mpg,
         'max_vehicle_range_miles': max_range,
-        'calculation_time_ms': round((time.time() - t_start) * 1000, 2)
+        'calculation_time_ms': round((time.perf_counter() - t_start) * 1000, 2),
     }

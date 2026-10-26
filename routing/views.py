@@ -1,7 +1,6 @@
 import time
 import urllib.parse
 from django.shortcuts import render
-from django.views.generic import TemplateView
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -14,6 +13,7 @@ from .serializers import (
     FuelStationSerializer
 )
 from .services import geocode_location, get_driving_route, optimize_fuel_route
+from .services.fuel_optimizer import RouteInfeasibleError, _get_fuel_stations_index
 
 class RouteOptimizationAPIView(APIView):
     """
@@ -54,7 +54,7 @@ class RouteOptimizationAPIView(APIView):
         return self._process_route_request(request, request.data)
 
     def _process_route_request(self, request, data):
-        t0 = time.time()
+        t0 = time.perf_counter()
         serializer = RouteRequestSerializer(data=data)
         if not serializer.is_valid():
             return Response({
@@ -68,24 +68,14 @@ class RouteOptimizationAPIView(APIView):
         mpg = serializer.validated_data.get('mpg', 10.0)
         max_deviation = serializer.validated_data.get('max_deviation_miles', 10.0)
 
-        # 1. Geocode Start & Finish Locations within the USA
+        # 1. Geocode Start & Finish Locations within the USA (local DB first, no network)
         try:
             start_geo = geocode_location(start_query)
-        except Exception as e:
-            return Response({
-                'success': False,
-                'error': f"Failed to geocode start location '{start_query}': {str(e)}"
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
             finish_geo = geocode_location(finish_query)
-        except Exception as e:
-            return Response({
-                'success': False,
-                'error': f"Failed to geocode finish location '{finish_query}': {str(e)}"
-            }, status=status.HTTP_400_BAD_REQUEST)
+        except ValueError as e:
+            return self._error(str(e), status.HTTP_400_BAD_REQUEST)
 
-        # 2. Compute Road Route via OSRM (1 single API call)
+        # 2. Compute Road Route via OSRM (1 external call, 0 when cached)
         try:
             route_data = get_driving_route(
                 start_lat=start_geo['lat'],
@@ -93,13 +83,12 @@ class RouteOptimizationAPIView(APIView):
                 finish_lat=finish_geo['lat'],
                 finish_lon=finish_geo['lon']
             )
-        except Exception as e:
-            return Response({
-                'success': False,
-                'error': f"Route calculation failed: {str(e)}"
-            }, status=status.HTTP_502_BAD_GATEWAY)
+        except ValueError as e:
+            return self._error(str(e), status.HTTP_422_UNPROCESSABLE_ENTITY)
+        except RuntimeError as e:
+            return self._error(str(e), status.HTTP_502_BAD_GATEWAY)
 
-        # 3. Calculate Optimal Fuel Stops along Route
+        # 3. Calculate Optimal Fuel Stops along Route (in-memory, no network)
         try:
             optimization_result = optimize_fuel_route(
                 route_coordinates=route_data['coordinates'],
@@ -108,20 +97,16 @@ class RouteOptimizationAPIView(APIView):
                 mpg=mpg,
                 max_deviation_miles=max_deviation
             )
-        except Exception as e:
-            return Response({
-                'success': False,
-                'error': f"Fuel optimization failed: {str(e)}"
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except RouteInfeasibleError as e:
+            return self._error(str(e), status.HTTP_422_UNPROCESSABLE_ENTITY)
 
-        t_end = time.time()
-        total_time_ms = round((t_end - t0) * 1000, 2)
+        total_time_ms = round((time.perf_counter() - t0) * 1000, 2)
 
         # Build Interactive Map URL with pre-filled query params
         map_params = urllib.parse.urlencode({
             'start': start_query,
             'finish': finish_query,
-            'range': max_range,
+            'max_range': max_range,
             'mpg': mpg
         })
         interactive_map_url = f"{request.build_absolute_uri('/')}?{map_params}"
@@ -153,8 +138,16 @@ class RouteOptimizationAPIView(APIView):
             },
             'fuel_stops_count': optimization_result['fuel_stops_count'],
             'fuel_stops': optimization_result['fuel_stops'],
+            'final_leg_miles': optimization_result['final_leg_miles'],
             'route_geometry': route_data['geojson'],
             'interactive_map_url': interactive_map_url,
+            'meta': {
+                'routing_api_calls': 0 if route_data['from_cache'] else 1,
+                'route_cache_hit': route_data['from_cache'],
+                'stations_considered': optimization_result['stations_considered'],
+                'search_corridor_miles': optimization_result['search_corridor_miles'],
+                'optimization_time_ms': optimization_result['calculation_time_ms'],
+            },
             'api_execution_time_ms': total_time_ms
         }
 
@@ -173,6 +166,10 @@ class RouteOptimizationAPIView(APIView):
             pass
 
         return Response(response_data, status=status.HTTP_200_OK)
+
+    @staticmethod
+    def _error(message, http_status):
+        return Response({'success': False, 'error': message}, status=http_status)
 
 
 class FuelStationsListAPIView(APIView):
@@ -196,7 +193,10 @@ class FuelStationsListAPIView(APIView):
         if city:
             qs = qs.filter(city__icontains=city.strip())
 
-        limit = min(int(request.query_params.get('limit', 50)), 500)
+        try:
+            limit = max(1, min(int(request.query_params.get('limit', 50)), 500))
+        except ValueError:
+            return Response({'error': "'limit' must be an integer."}, status=status.HTTP_400_BAD_REQUEST)
         stations = qs[:limit]
         serializer = FuelStationSerializer(stations, many=True)
         return Response({
@@ -220,6 +220,7 @@ class HealthCheckAPIView(APIView):
             'status': 'healthy',
             'database': 'connected',
             'fuel_stations_loaded': station_count,
+            'fuel_stations_indexed': len(_get_fuel_stations_index()['df']),
             'routing_engine': 'OSRM Public Demo Server',
             'geocoder': 'US Cities Local DB + OpenStreetMap Nominatim'
         }, status=status.HTTP_200_OK)
@@ -229,7 +230,7 @@ def interactive_map_view(request):
     """Renders the interactive Leaflet.js map and control dashboard."""
     start = request.GET.get('start', 'New York, NY')
     finish = request.GET.get('finish', 'Los Angeles, CA')
-    max_range = request.GET.get('range', '500')
+    max_range = request.GET.get('max_range', request.GET.get('range', '500'))
     mpg = request.GET.get('mpg', '10')
 
     context = {

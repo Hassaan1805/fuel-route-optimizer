@@ -1,6 +1,7 @@
 import os
 import pandas as pd
 from django.core.management.base import BaseCommand
+from django.db import transaction
 from routing.models import FuelStation
 from routing.data_builder import build_geocoded_fuel_dataset, GEOCODED_CSV
 
@@ -15,14 +16,11 @@ class Command(BaseCommand):
         self.stdout.write(f"Reading from {GEOCODED_CSV}...")
         df = pd.read_csv(GEOCODED_CSV)
 
+        # The CSV is the source of truth: replace the table so re-running after a
+        # data rebuild picks up corrected prices and coordinates.
         stations_to_create = []
-        existing_ids = set(FuelStation.objects.values_list('opis_id', flat=True))
-
         for _, row in df.iterrows():
             opis_id = int(row['opis_id'])
-            if opis_id in existing_ids:
-                continue
-
             stations_to_create.append(
                 FuelStation(
                     opis_id=opis_id,
@@ -37,9 +35,7 @@ class Command(BaseCommand):
                 )
             )
 
-        if stations_to_create:
-            self.stdout.write(f"Inserting {len(stations_to_create)} stations...")
+        with transaction.atomic():
+            FuelStation.objects.all().delete()
             FuelStation.objects.bulk_create(stations_to_create, batch_size=1000)
-            self.stdout.write(self.style.SUCCESS(f"Successfully loaded {len(stations_to_create)} fuel stations!"))
-        else:
-            self.stdout.write(self.style.SUCCESS(f"Database already up to date with {len(existing_ids)} stations."))
+        self.stdout.write(self.style.SUCCESS(f"Loaded {len(stations_to_create)} fuel stations."))

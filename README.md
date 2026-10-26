@@ -1,344 +1,157 @@
-# ⛽ FuelPath AI - Optimal Fuel Routing API & Map Engine
+# ⛽ FuelPath — Optimal Fuel Routing API
 
-A high-performance Django web application and REST API that calculates driving routes across the USA and determines the **most cost-effective refueling stops** based on real-world retail fuel prices from OPIS.
+A Django REST API that takes a start and finish location in the USA, routes the trip, and returns the **cheapest place(s) to buy fuel** along the way from the provided OPIS truck-stop price list, plus the **total fuel cost**. It assumes a 500-mile range and 10 MPG by default. An interactive Leaflet map at `/` shows the same result.
 
-Built for **latest stable Django (6.x/5.x)**, **Django REST Framework**, and **OSRM Routing Engine**, with an interactive **Leaflet.js** map visualizer, automated **Swagger / OpenAPI** documentation, and a ready-to-import **Postman collection**.
-
----
-
-## 🌟 Key Features
-
-- **Optimal Fuel Selection**: Uses a **Penalized Dynamic Programming (DAG Shortest Path)** algorithm to select the cheapest fuel stops along the route.
-- **Strict Vehicle Range Constraints**: Strictly enforces the vehicle's maximum range (default: **500 miles** on a full tank) and fuel economy (**10 MPG**). No leg between consecutive stops ever exceeds 500 miles.
-- **Blazing Fast Performance**:
-  - **In-memory 3D Spatial Indexing**: Over 6,600 pre-geocoded US truck stops indexed via `scipy.spatial.cKDTree` on 3D Earth coordinates. Corridor search along a 2,800-mile route takes **under 5 milliseconds**.
-  - **DP Optimization**: Finds the global cost-minimum refueling plan in **under 30 milliseconds**.
-  - **Local-first Geocoding**: In-memory database of ~30,000 US cities resolves coordinates in **0 ms** without external API rate limits.
-- **Minimal External Routing Calls**: Uses **Open Source Routing Machine (OSRM)** public API. **Exactly 1 single API call** is made per route calculation.
-- **Rich Interactive Map UI**: A modern dark-mode web dashboard featuring Leaflet.js map, route polyline, origin/destination flags, custom gas-pump markers with badge numbers, KPI cards, step-by-step refueling itinerary, and 1-click route presets.
-- **Loom & Postman Ready**: Includes a complete Postman collection (`Fuel_Route_API.postman_collection.json`) and a minute-by-minute Loom video script (`LOOM_WALKTHROUGH.md`).
+Built with **Django 6.1** (latest stable), Django REST Framework, OSRM (free routing), and Leaflet + OpenStreetMap (free map tiles). No API keys are needed.
 
 ---
 
-## 🏗️ System Architecture
+## How it works
 
 ```mermaid
-flowchart TD
-    User([User / Postman / Browser]) -->|GET or POST /api/route/| View[RouteOptimizationAPIView]
-    
-    subgraph Geocoding
-        View --> GeoService[Geocoding Service]
-        GeoService -->|Fast Local Lookup| LocalDB[(US Cities Index ~30k)]
-        GeoService -.->|Fallback if needed| Nominatim[OSM Nominatim API]
-    end
-    
-    subgraph Routing
-        View --> OSRMService[OSRM Routing Service]
-        OSRMService -->|1 Single HTTP Call| OSRM[OSRM Public Router]
-        OSRMService --> Cache[(Django In-Memory Cache)]
-    end
-    
-    subgraph Optimization
-        View --> Optimizer[Fuel Optimization Engine]
-        Optimizer -->|Radius Ball Query <5ms| KDTree[3D Spatial cKDTree ~6.6k Stations]
-        Optimizer -->|DAG Shortest Path <30ms| DPAlgorithm[Penalized Dynamic Programming]
-    end
-    
-    Optimizer --> View
-    View -->|JSON + GeoJSON + Map URL| User
-    User -->|View Browser UI| MapUI[Leaflet.js Interactive Web Map]
+flowchart LR
+    A[GET/POST /api/route/] --> B[Geocode start & finish]
+    B -->|local DB of ~30k US cities, 0 network calls| C[OSRM route — 1 external call, cached]
+    C --> D[KD-tree: stations within 10 mi of the route]
+    D --> E[DP over stations × fuel-in-tank]
+    E --> F[JSON: stops, costs, GeoJSON route, map URL]
 ```
+
+1. **Geocoding (no API call for normal input).** `City, ST`, `City, State Name`, ZIP suffixes and `lat,lon` all resolve from an in-memory US cities table. OpenStreetMap Nominatim is used only for street addresses or bare ambiguous names like "Springfield".
+2. **Routing: one OSRM call per trip.** It returns road distance, duration and the full route polyline. The result is cached on disk, so a repeated trip makes **0** external calls. Each response reports this in `meta.routing_api_calls`.
+3. **Stations along the route.** The 6,626 geocoded stations sit in a 3D KD-tree. A single vectorized query finds every station within 10 miles of the route and its mile marker. If the route has a gap longer than the range, the corridor widens automatically, up to 35 mi.
+4. **Optimization: exact DP.** The vehicle starts empty, fills up near the origin, can buy any amount at any station, and arrives empty.
+   - State = (station, fuel in the tank), with fuel tracked in 0.1-gal steps.
+   - Passing a station is the same as stopping and buying 0 gal, so the DP only moves station to station. Buying is a prefix-minimum over fuel levels, which makes it O(stations × levels) in NumPy.
+   - Each stop has a $10 penalty plus the fuel cost of the detour off the highway. The penalty is used only to choose stops, so the plan doesn't pull over to save a few cents, and it is **not** included in the reported cost. NY → LA comes out at 7 stops for $859 vs. 20 stops for $849 without the penalty.
+   - Guarantees: no leg exceeds the range, the tank never holds more than `range / mpg` gallons, `sum(cost_at_stop) == total_fuel_cost`, and `total_fuel_gallons == distance / mpg`.
+
+Typical server time is **30–80 ms** once the route is cached. A first-time request adds 1–4 s for the single OSRM call.
 
 ---
 
-## 🚀 Quick Start
+## Quick start
 
-### 1. Prerequisites
-- Python 3.10+ (Tested on Python 3.13)
-- Git
-
-### 2. Setup Virtual Environment & Install Dependencies
 ```bash
-# Clone or navigate to the repository directory
-cd "Django assignment"
-
-# Create virtual environment
 python -m venv .venv
-
-# Activate virtual environment
-# Windows (PowerShell):
-.venv\Scripts\Activate.ps1
-# Windows (cmd):
-.venv\Scripts\activate.bat
-# Linux/macOS:
-source .venv/bin/activate
-
-# Install dependencies
+.venv\Scripts\activate          # Windows  (source .venv/bin/activate on macOS/Linux)
 pip install -r requirements.txt
-```
-
-### 3. Initialize Database & Pre-Geocode Fuel Stations
-```bash
-# Run migrations
 python manage.py migrate
-
-# Load and index fuel stations from CSV into database
-python manage.py load_fuel_stations
+python manage.py load_fuel_stations   # loads data/fuel_stations_geocoded.csv into the DB
+python manage.py runserver
 ```
 
-### 4. Run Development Server
-```bash
-python manage.py runserver 127.0.0.1:8000
-```
-Open **[http://127.0.0.1:8000/](http://127.0.0.1:8000/)** in your web browser!
+Open <http://127.0.0.1:8000/> for the map, or <http://127.0.0.1:8000/api/docs/> for Swagger.
+
+`data/fuel_stations_geocoded.csv` is committed, so nothing is downloaded at runtime. To rebuild it from `fuel-prices-for-be-assessment.csv`, run `python routing/data_builder.py`. It matches each station's city/state against the US cities table; the 112 Canadian stations are dropped.
+
+### Deploy to Render
+
+`render.yaml` is a Render Blueprint. In Render, choose **New → Blueprint**, pick this repo and click **Apply**. It installs dependencies, runs `collectstatic`, and on boot runs migrations, loads the stations, and starts gunicorn. Static files are served by WhiteNoise. `DJANGO_SECRET_KEY` is generated by Render and `DJANGO_DEBUG=False` is set for you. The free plan sleeps when idle, so the first request after a pause takes about 30–60 s.
+
+To point the Postman collection at the deployed app, change its `baseUrl` variable to the Render URL.
 
 ---
 
-## 📡 API Reference
+## API
 
-### 1. Route & Fuel Optimization Endpoint
+### `GET /api/route/` or `POST /api/route/`
 
-**`GET /api/route/`** or **`POST /api/route/`**
+| Parameter | Type | Default | Description |
+| :-- | :-- | :-: | :-- |
+| `start` | string | — | `"New York, NY"`, `"Austin, Texas"`, an address, or `"40.7128,-74.0060"` |
+| `finish` | string | — | Same formats as `start` |
+| `max_range` | float | `500` | Miles on a full tank |
+| `mpg` | float | `10` | Fuel economy |
+| `max_deviation_miles` | float | `10` | How far off the route a station may be |
 
-#### Query Parameters (GET) / JSON Body (POST):
-| Parameter | Type | Required | Default | Description |
-| :--- | :--- | :---: | :---: | :--- |
-| `start` | string | **Yes** | — | Starting location in the USA (e.g. `'New York, NY'` or `'40.7128,-74.0060'`) |
-| `finish` | string | **Yes** | — | Destination in the USA (e.g. `'Los Angeles, CA'` or `'34.0522,-118.2437'`) |
-| `max_range` | float | No | `500.0` | Maximum vehicle driving range on a full tank (miles) |
-| `mpg` | float | No | `10.0` | Vehicle fuel efficiency (miles per gallon) |
-| `max_deviation_miles` | float | No | `10.0` | Maximum corridor search radius off highway path (miles) |
-
-#### Example Request (cURL):
 ```bash
-curl -X GET "http://127.0.0.1:8000/api/route/?start=New+York,NY&finish=Los+Angeles,CA&max_range=500&mpg=10"
+curl "http://127.0.0.1:8000/api/route/?start=New+York,+NY&finish=Los+Angeles,+CA"
+
+curl -X POST http://127.0.0.1:8000/api/route/ -H "Content-Type: application/json" \
+     -d '{"start": "Chicago, IL", "finish": "Miami, FL"}'
 ```
 
-#### Example Request (POST JSON):
-```bash
-curl -X POST "http://127.0.0.1:8000/api/route/" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "start": "Chicago, IL",
-    "finish": "Miami, FL",
-    "max_range": 500,
-    "mpg": 10
-  }'
-```
+Response, trimmed to 2 of the 7 stops:
 
-#### Example Response (Truncated for brevity):
 ```json
 {
   "success": true,
-  "start": {
-    "query": "New York, NY",
-    "display_name": "New York, NY, USA",
-    "latitude": 40.7128,
-    "longitude": -74.0060
-  },
-  "finish": {
-    "query": "Los Angeles, CA",
-    "display_name": "Los Angeles, CA, USA",
-    "latitude": 34.0522,
-    "longitude": -118.2437
-  },
+  "start":  { "query": "New York, NY", "display_name": "New York, NY, USA", "latitude": 40.74838, "longitude": -73.996705 },
+  "finish": { "query": "Los Angeles, CA", "display_name": "Los Angeles, CA, USA", "latitude": 33.973093, "longitude": -118.247896 },
   "total_distance_miles": 2800.62,
   "total_duration_hours": 49.88,
-  "total_fuel_gallons": 280.06,
-  "total_fuel_cost": 867.35,
-  "average_price_per_gallon": 3.097,
-  "vehicle_specs": {
-    "max_vehicle_range_miles": 500.0,
-    "fuel_efficiency_mpg": 10.0,
-    "tank_capacity_gallons": 50.0
-  },
-  "fuel_stops_count": 6,
+  "total_fuel_gallons": 280.1,
+  "total_fuel_cost": 859.17,
+  "average_price_per_gallon": 3.067,
+  "vehicle_specs": { "max_vehicle_range_miles": 500.0, "fuel_efficiency_mpg": 10.0, "tank_capacity_gallons": 50.0 },
+  "fuel_stops_count": 7,
   "fuel_stops": [
     {
-      "stop_number": 1,
-      "opis_id": 72445,
-      "name": "SHEETZ #639",
-      "address": "I-80 Exit 223",
-      "city": "Youngstown",
-      "state": "OH",
-      "retail_price": 3.059,
-      "route_mile": 392.1,
-      "leg_distance_miles": 392.1,
-      "gallons_pumped": 39.2,
-      "cost_at_stop": 119.94,
-      "miles_off_route": 0.08,
-      "latitude": 41.0998,
-      "longitude": -80.6495
+      "stop_number": 1, "stop_type": "origin", "opis_id": 62790,
+      "name": "7-ELEVEN #40084", "address": "US-46/US-1/US-9", "city": "Palisades Park", "state": "NJ",
+      "retail_price": 3.099, "route_mile": 0.0, "leg_distance_miles": 0.0,
+      "fuel_on_arrival_gallons": 0.0, "gallons_pumped": 40.1, "cost_at_stop": 124.27,
+      "miles_off_route": 6.75, "latitude": 40.846238, "longitude": -73.995436
     },
     {
-      "stop_number": 2,
-      "opis_id": 70744,
-      "name": "CASEYS #3686",
-      "address": "I-80 EXIT 81",
-      "city": "Utica",
-      "state": "IL",
-      "retail_price": 2.969,
-      "route_mile": 853.7,
-      "leg_distance_miles": 461.6,
-      "gallons_pumped": 46.2,
-      "cost_at_stop": 137.05,
-      "miles_off_route": 1.25,
-      "latitude": 41.3414,
-      "longitude": -89.0115
-    },
-    {
-      "stop_number": 3,
-      "opis_id": 68368,
-      "name": "AKAL TRAVEL CENTER",
-      "address": "I-80 EX 360",
-      "city": "Waco",
-      "state": "NE",
-      "retail_price": 2.799,
-      "route_mile": 1335.8,
-      "leg_distance_miles": 482.1,
-      "gallons_pumped": 48.2,
-      "cost_at_stop": 134.91,
-      "miles_off_route": 0.45,
-      "latitude": 40.8986,
-      "longitude": -97.4606
-    },
-    {
-      "stop_number": 4,
-      "opis_id": 71301,
-      "name": "7-ELEVEN 42279",
-      "address": "I-76, Exit 39",
-      "city": "Keenesburg",
-      "state": "CO",
-      "retail_price": 3.149,
-      "route_mile": 1739.4,
-      "leg_distance_miles": 403.6,
-      "gallons_pumped": 40.4,
-      "cost_at_stop": 127.13,
-      "miles_off_route": 0.32,
-      "latitude": 40.1089,
-      "longitude": -104.5205
-    },
-    {
-      "stop_number": 5,
-      "opis_id": 71712,
-      "name": "MAVERIK COUNTRY STORE #693",
-      "address": "I-70, Exit 160 & hwy 191",
-      "city": "Green River",
-      "state": "UT",
-      "retail_price": 3.282,
-      "route_mile": 2120.9,
-      "leg_distance_miles": 381.5,
-      "gallons_pumped": 38.1,
-      "cost_at_stop": 125.22,
-      "miles_off_route": 0.15,
-      "latitude": 38.9955,
-      "longitude": -110.1596
-    },
-    {
-      "stop_number": 6,
-      "opis_id": 72965,
-      "name": "Maverik #674",
-      "address": "I-15, Exit 45",
-      "city": "North Las Vegas",
-      "state": "NV",
-      "retail_price": 3.282,
-      "route_mile": 2498.9,
-      "leg_distance_miles": 378.0,
-      "gallons_pumped": 37.8,
-      "cost_at_stop": 124.07,
-      "miles_off_route": 0.40,
-      "latitude": 36.1989,
-      "longitude": -115.1175
+      "stop_number": 2, "stop_type": "en_route", "opis_id": 72782,
+      "name": "SHEETZ #791", "address": "I-76, Exit 57", "city": "North Jackson", "state": "OH",
+      "retail_price": 3.066, "route_mile": 401.4, "leg_distance_miles": 401.4,
+      "fuel_on_arrival_gallons": 0.0, "gallons_pumped": 45.3, "cost_at_stop": 138.87,
+      "miles_off_route": 2.13, "latitude": 41.088044, "longitude": -80.86225
     }
   ],
-  "route_geometry": {
-    "type": "LineString",
-    "coordinates": [
-      [-74.006, 40.7128],
-      "..."
-    ]
-  },
-  "interactive_map_url": "http://127.0.0.1:8000/?start=New+York%2C+NY&finish=Los+Angeles%2C+CA&range=500.0&mpg=10.0",
-  "api_execution_time_ms": 66.04
+  "final_leg_miles": 301.7,
+  "route_geometry": { "type": "LineString", "coordinates": [[-73.9965, 40.7486], "..."] },
+  "interactive_map_url": "http://127.0.0.1:8000/?start=New+York%2C+NY&finish=Los+Angeles%2C+CA&max_range=500.0&mpg=10.0",
+  "meta": { "routing_api_calls": 0, "route_cache_hit": true, "stations_considered": 473, "search_corridor_miles": 10.0, "optimization_time_ms": 50.5 },
+  "api_execution_time_ms": 67.0
 }
 ```
 
+`route_geometry` is simplified (Douglas–Peucker, ~50 m tolerance) for drawing: NY → LA drops from ~35k to ~2.6k points (790 KB → 56 KB). The full-resolution line is still used for the station search.
+
+**Errors** always come back as `{"success": false, "error": "..."}`:
+
+| Status | When |
+| :-: | :-- |
+| 400 | Missing/invalid parameters, a location that can't be found, or one outside the continental US |
+| 422 | No drivable route, or no refueling plan exists with the stations in the price list |
+| 502 | The routing service is unreachable |
+
+**Data limitation:** the provided price list has almost no stations in California and Oregon. Seattle → San Diego on I-5 therefore has a ~1,000-mile stretch with no fuel, and the API returns a 422 naming the exact gap rather than an invalid plan.
+
+### Other endpoints
+
+- `GET /api/stations/?state=TX&city=Dallas&limit=25` searches the station table
+- `GET /api/health/` is a health check
+- `GET /api/docs/` is the Swagger UI and `GET /api/schema/` the OpenAPI schema
+
 ---
 
-### 2. Other Available Endpoints
-- **`GET /api/stations/?state=TX&limit=25`**: Browse and query the OPIS fuel stations dataset by state or city.
-- **`GET /api/health/`**: System and database connectivity health check.
-- **`GET /api/docs/`**: Interactive Swagger UI API documentation.
-- **`GET /api/schema/`**: OpenAPI 3.0 YAML/JSON specification.
+## Tests
 
----
-
-## 🧪 Running Automated Tests
-
-A comprehensive test suite of 12 unit and integration tests is included:
 ```bash
 python manage.py test routing
 ```
-**Test Coverage Includes:**
-- Coordinate parsing and USA bounding box validation.
-- Local in-memory US city geocoding.
-- OSRM route parsing.
-- Under 500 miles route verification (0 refueling stops).
-- Long-distance route refueling (all legs $\le 500$ miles).
-- API `GET` and `POST` response validation.
-- Missing and invalid parameter error handling.
-- Web UI template rendering.
+
+There are 22 tests. They cover the purchase-plan DP on hand-checked cases (fill at the cheap station, top up at the expensive one; skip stops that save cents), range and tank limits on a long route, cost and gallon totals, infeasible routes (422), geocoding formats and the offline fallback, geometry simplification, and every endpoint. The API tests mock OSRM, so the suite runs offline.
+
+The Postman collection (`Fuel_Route_API.postman_collection.json`, also downloadable from the map page) has assertions on every route request.
 
 ---
 
-## 📽️ Loom Video Recording Guide
-
-A complete 5-minute video presentation outline and script is included in [**`LOOM_WALKTHROUGH.md`**](file:///f:/Stuff/Django%20assignment/LOOM_WALKTHROUGH.md).
-
-### Quick Steps to Record:
-1. Ensure the development server is running: `python manage.py runserver`
-2. Open Postman and import `Fuel_Route_API.postman_collection.json`.
-3. Open `LOOM_WALKTHROUGH.md` and follow the minute-by-minute speaking cues.
-
----
-
-## 📦 Project Structure
+## Project layout
 
 ```
-├── fuel_routing_project/          # Django Project Configuration
-│   ├── settings.py                # Django Settings (DRF, CORS, Spectacular, Caching)
-│   ├── urls.py                    # Root URL Routing
-│   ├── wsgi.py                    # WSGI Gateway
-├── routing/                       # Main Routing Application
-│   ├── data_builder.py            # Pre-geocoding builder for fuel stations
-│   ├── models.py                  # FuelStation & RouteQueryLog models
-│   ├── serializers.py             # DRF Serializers for API request/response
-│   ├── views.py                   # RouteOptimizationAPIView, UI & Health Views
-│   ├── urls.py                    # App URLs
-│   ├── tests.py                   # Automated Test Suite (12 tests)
-│   ├── services/                  # Business Logic & Algorithms
-│   │   ├── geocoding.py           # Local-first US Geocoder + Nominatim fallback
-│   │   ├── osrm.py                # OSRM Driving Route Client + Cache
-│   │   └── fuel_optimizer.py      # 3D KD-Tree + Penalized DP Refueling Engine
-│   └── management/commands/       # Custom Django Management Commands
-│       └── load_fuel_stations.py  # Loads geocoded stations into SQLite
-├── data/                          # Geographic Data Assets
-│   ├── fuel_stations_geocoded.csv # 6,626 Pre-geocoded US stations
-│   └── us_cities.csv              # 29,880 US cities database
-├── templates/                     # HTML Templates
-│   └── routing/map.html           # Leaflet.js Interactive Web Map & Control Panel
-├── static/                        # Static Assets (CSS, JS, Postman Collection)
-│   ├── css/style.css              # Modern Dark Aesthetic Design System
-│   ├── js/app.js                  # Frontend Controller & Map Rendering
-│   └── Fuel_Route_API.postman_collection.json
-├── Fuel_Route_API.postman_collection.json # Root Postman Collection for import
-├── LOOM_WALKTHROUGH.md            # 5-Minute Loom Video Script
-├── fuel-prices-for-be-assessment.csv # Original OPIS Fuel Prices CSV
-├── requirements.txt               # Python Dependencies
-└── manage.py                      # Django CLI
+routing/
+  services/geocoding.py       local-first US geocoder (+ Nominatim fallback)
+  services/osrm.py            single OSRM call, disk cache, line simplification
+  services/fuel_optimizer.py  KD-tree corridor search + fuel DP
+  views.py, serializers.py    DRF endpoints and OpenAPI schema
+  data_builder.py             builds data/fuel_stations_geocoded.csv from the raw CSV
+  tests.py
+templates/routing/map.html, static/js/app.js, static/css/style.css   map UI
+data/                         geocoded stations + US cities table
 ```
-
----
-
-## ⚖️ License
-MIT License. Built for the Coding Assessment.

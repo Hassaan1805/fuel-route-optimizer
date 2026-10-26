@@ -1,0 +1,23 @@
+# Render Blueprint: New > Blueprint > pick this repo.
+services:
+  - type: web
+    name: fuelpath
+    runtime: python
+    plan: free
+    buildCommand: >-
+      pip install -r requirements.txt &&
+      python manage.py collectstatic --noinput
+    # SQLite lives on the instance's disk, so create and load it at boot.
+    # One worker with threads keeps the in-memory station index under the free tier's 512 MB.
+    startCommand: >-
+      python manage.py migrate --noinput &&
+      python manage.py load_fuel_stations &&
+      gunicorn fuel_routing_project.wsgi:application --workers 1 --threads 4 --timeout 60 --bind 0.0.0.0:$PORT
+    healthCheckPath: /api/health/
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.5
+      - key: DJANGO_DEBUG
+        value: "False"
+      - key: DJANGO_SECRET_KEY
+        generateValue: true

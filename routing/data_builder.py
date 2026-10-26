@@ -31,12 +31,34 @@ def download_cities_database():
     else:
         print("US Cities database already exists locally.")
 
+def dedupe_city_rows(cities_df):
+    """
+    Returns one row per (CITY, STATE_CODE). The cities database lists some cities
+    once per county they touch (e.g. Austin, TX in Hays, Travis and Williamson);
+    prefer the county named after the city, otherwise the row nearest the others.
+    """
+    key = [cities_df['CITY'].str.strip().str.upper(), cities_df['STATE_CODE'].str.strip().str.upper()]
+    dup_mask = cities_df.duplicated(subset=['CITY', 'STATE_CODE'], keep=False)
+
+    def pick(group):
+        same_county = group[group['COUNTY'].astype(str).str.upper() == group['CITY'].iloc[0].upper()]
+        if len(same_county):
+            return same_county.index[0]
+        pts = group[['LATITUDE', 'LONGITUDE']].values
+        spread = np.abs(pts[:, None, :] - pts[None, :, :]).sum(axis=(1, 2))
+        return group.index[int(np.argmin(spread))]
+
+    dups = cities_df[dup_mask]
+    keep_idx = dups.groupby([k[dup_mask] for k in key]).apply(pick, include_groups=False) if len(dups) else []
+    return pd.concat([cities_df[~dup_mask], cities_df.loc[list(keep_idx)]]).sort_index()
+
+
 def build_geocoded_fuel_dataset():
     download_cities_database()
 
     print("Loading data files...")
     fuel_df = pd.read_csv(RAW_FUEL_CSV)
-    cities_df = pd.read_csv(CITIES_CSV)
+    cities_df = dedupe_city_rows(pd.read_csv(CITIES_CSV))
 
     # Standardize city and state strings
     fuel_df['city_clean'] = fuel_df['City'].astype(str).str.strip().str.upper()

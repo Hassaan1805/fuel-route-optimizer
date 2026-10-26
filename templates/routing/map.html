@@ -1,176 +1,180 @@
-<!DOCTYPE html>
+{% load static %}<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FuelPath AI | Optimal US Route & Fuel Planner</title>
-    <meta name="description" content="Calculate the most cost-effective fuel stops and map driving routes across the USA with real OPIS retail fuel prices.">
-    
-    <!-- Google Fonts -->
+    <meta name="color-scheme" content="light">
+    <title>FuelPath | Cheapest Fuel Stops on Any US Route</title>
+    <meta name="description" content="Plan a US driving route with the most cost-effective fuel stops, using real OPIS truck-stop prices.">
+
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-    
-    <!-- Leaflet CSS -->
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
-    
-    <!-- FontAwesome Icons -->
+    <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@700;800;900&family=Overpass:wght@400;600;700;800&family=Overpass+Mono:wght@500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
-    
-    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="{% static 'css/style.css' %}">
 </head>
 <body>
-    <div class="app-container">
-        <!-- Sidebar Controls & Itinerary -->
-        <aside class="sidebar">
-            <header class="app-header">
-                <div class="brand">
-                    <div class="brand-icon">
-                        <i class="fa-solid fa-gas-pump"></i>
+<div class="app">
+    <aside class="panel">
+        <header class="masthead">
+            <div class="shield" aria-label="Vehicle range">
+                <svg viewBox="0 0 64 68" aria-hidden="true">
+                    <defs>
+                        <clipPath id="shieldInner">
+                            <path d="M8 9c9 3 17-1 24-5 7 4 15 8 24 5 4 20 2 40-24 53C6 49 4 29 8 9z"/>
+                        </clipPath>
+                    </defs>
+                    <path d="M4 5c11 4 20-1 28-5 8 4 17 9 28 5 5 24 2 46-28 63C2 51-1 29 4 5z" fill="#fff"/>
+                    <g clip-path="url(#shieldInner)">
+                        <rect width="64" height="68" fill="#1f3f8f"/>
+                        <rect width="64" height="20" fill="#c8102e"/>
+                    </g>
+                </svg>
+                <span class="shield-label">RANGE</span>
+                <span class="shield-num" id="shieldNum">{{ initial_range|floatformat:0 }}</span>
+            </div>
+            <div class="wordmark">
+                <h1>Fuel<span>Path</span></h1>
+                <p>Cheapest diesel stops, coast to coast</p>
+            </div>
+            <nav class="masthead-links">
+                <a href="/api/docs/" target="_blank" rel="noopener">API docs ↗</a>
+                <a href="{% static 'Fuel_Route_API.postman_collection.json' %}" download>Postman ↓</a>
+            </nav>
+        </header>
+
+        <form id="routeForm" class="trip-form" novalidate>
+            <div class="legs">
+                <label class="leg leg-from">
+                    <span class="leg-tag">FROM</span>
+                    <input type="text" id="startInput" name="start" value="{{ initial_start }}"
+                           placeholder="City, ST — or lat,lon" autocomplete="off" required>
+                </label>
+                <button type="button" id="swapBtn" class="swap" title="Swap origin and destination" aria-label="Swap origin and destination">⇅</button>
+                <label class="leg leg-to">
+                    <span class="leg-tag">TO</span>
+                    <input type="text" id="finishInput" name="finish" value="{{ initial_finish }}"
+                           placeholder="City, ST — or lat,lon" autocomplete="off" required>
+                </label>
+            </div>
+
+            <div class="specs">
+                <label class="spec">
+                    <span>Range</span>
+                    <input type="number" id="rangeInput" name="max_range" value="{{ initial_range }}" min="50" max="2000" step="10">
+                    <em>mi</em>
+                </label>
+                <label class="spec">
+                    <span>Economy</span>
+                    <input type="number" id="mpgInput" name="mpg" value="{{ initial_mpg }}" min="1" max="100" step="0.5">
+                    <em>mpg</em>
+                </label>
+            </div>
+
+            <button type="submit" id="submitBtn" class="go">
+                <span class="btn-label">Plan fuel stops <b>→</b></span>
+                <span class="btn-busy hidden">Routing<span class="dots"></span></span>
+            </button>
+
+            <div class="presets">
+                <span>Popular runs</span>
+                <button type="button" class="preset" data-start="New York, NY" data-finish="Los Angeles, CA">NYC – LA</button>
+                <button type="button" class="preset" data-start="Chicago, IL" data-finish="Miami, FL">CHI – MIA</button>
+                <button type="button" class="preset" data-start="Seattle, WA" data-finish="Denver, CO">SEA – DEN</button>
+                <button type="button" class="preset" data-start="Austin, TX" data-finish="Dallas, TX">AUS – DAL</button>
+            </div>
+        </form>
+
+        <div id="errorBox" class="detour hidden" role="alert">
+            <div class="detour-sign" aria-hidden="true"><span>!</span></div>
+            <div>
+                <strong>Route not possible</strong>
+                <p id="errorText"></p>
+            </div>
+        </div>
+
+        <section id="results" class="results hidden" aria-live="polite">
+            <div class="pump">
+                <div class="pump-head">
+                    <span>Total fuel cost</span>
+                    <span class="pump-brand">FUELPATH · OPIS PRICES</span>
+                </div>
+                <div class="pump-row pump-main">
+                    <span class="pump-unit">$</span>
+                    <span class="lcd lcd-xl" id="kpiCost" data-ghost="888.88">0.00</span>
+                </div>
+                <div class="pump-grid">
+                    <div>
+                        <span class="pump-label">Gallons</span>
+                        <span class="lcd" id="kpiGallons" data-ghost="888.8">0.0</span>
                     </div>
                     <div>
-                        <h1>FuelPath <span class="gradient-text">AI</span></h1>
-                        <p class="tagline">USA Optimal Fuel & Route Engine</p>
+                        <span class="pump-label">Avg $ / gal</span>
+                        <span class="lcd" id="kpiAvgPrice" data-ghost="8.888">0.000</span>
                     </div>
-                </div>
-                <div class="header-badges">
-                    <a href="/api/docs/" target="_blank" class="badge-link" title="OpenAPI / Swagger Documentation">
-                        <i class="fa-solid fa-code"></i> API Docs
-                    </a>
-                    <button id="downloadPostmanBtn" class="badge-link btn-postman" title="Download Postman Collection">
-                        <i class="fa-solid fa-paper-plane"></i> Postman
-                    </button>
-                </div>
-            </header>
-
-            <!-- Route Query Form -->
-            <section class="form-card">
-                <form id="routeForm">
-                    <div class="input-group">
-                        <label for="startInput"><i class="fa-solid fa-location-dot start-icon"></i> Start Location (USA)</label>
-                        <div class="input-wrapper">
-                            <input type="text" id="startInput" name="start" value="{{ initial_start }}" placeholder="e.g. New York, NY or 40.7128,-74.0060" required>
-                            <button type="button" class="btn-clear" onclick="document.getElementById('startInput').value='';"><i class="fa-solid fa-xmark"></i></button>
-                        </div>
-                    </div>
-
-                    <div class="input-group">
-                        <label for="finishInput"><i class="fa-solid fa-flag-checkered finish-icon"></i> Finish Location (USA)</label>
-                        <div class="input-wrapper">
-                            <input type="text" id="finishInput" name="finish" value="{{ initial_finish }}" placeholder="e.g. Los Angeles, CA or 34.0522,-118.2437" required>
-                            <button type="button" class="btn-clear" onclick="document.getElementById('finishInput').value='';"><i class="fa-solid fa-xmark"></i></button>
-                        </div>
-                    </div>
-
-                    <!-- Vehicle Parameters Accordion -->
-                    <div class="params-row">
-                        <div class="param-item">
-                            <label for="rangeInput"><i class="fa-solid fa-gauge-high"></i> Max Range (mi)</label>
-                            <input type="number" id="rangeInput" name="max_range" value="{{ initial_range }}" min="100" max="1500" step="10">
-                        </div>
-                        <div class="param-item">
-                            <label for="mpgInput"><i class="fa-solid fa-truck-fast"></i> Efficiency (MPG)</label>
-                            <input type="number" id="mpgInput" name="mpg" value="{{ initial_mpg }}" min="2" max="60" step="0.5">
-                        </div>
-                    </div>
-
-                    <button type="submit" id="submitBtn" class="btn-primary">
-                        <span class="btn-text"><i class="fa-solid fa-route"></i> Calculate Optimal Route</span>
-                        <span class="btn-spinner hidden"><i class="fa-solid fa-circle-notch fa-spin"></i> Calculating...</span>
-                    </button>
-                </form>
-
-                <!-- 1-Click Presets -->
-                <div class="presets-section">
-                    <span class="presets-label">Quick Presets:</span>
-                    <div class="presets-grid">
-                        <button type="button" class="preset-pill" data-start="New York, NY" data-finish="Los Angeles, CA">
-                            🗽 NY &rarr; LA (2,790 mi)
-                        </button>
-                        <button type="button" class="preset-pill" data-start="Chicago, IL" data-finish="Miami, FL">
-                            🌴 Chicago &rarr; Miami
-                        </button>
-                        <button type="button" class="preset-pill" data-start="Seattle, WA" data-finish="San Diego, CA">
-                            🌲 Seattle &rarr; San Diego
-                        </button>
-                        <button type="button" class="preset-pill" data-start="Austin, TX" data-finish="Dallas, TX">
-                            🤠 Austin &rarr; Dallas
-                        </button>
-                    </div>
-                </div>
-            </section>
-
-            <!-- Results Section (Visible after calculation) -->
-            <section id="resultsSection" class="results-section hidden">
-                <!-- KPI Dashboard Cards -->
-                <div class="kpi-grid">
-                    <div class="kpi-card highlight">
-                        <div class="kpi-label"><i class="fa-solid fa-dollar-sign"></i> Total Fuel Cost</div>
-                        <div class="kpi-value" id="kpiCost">$0.00</div>
-                        <div class="kpi-sub" id="kpiAvgPrice">Avg: $0.00 / gal</div>
-                    </div>
-                    <div class="kpi-card">
-                        <div class="kpi-label"><i class="fa-solid fa-road"></i> Total Distance</div>
-                        <div class="kpi-value" id="kpiDistance">0 mi</div>
-                        <div class="kpi-sub" id="kpiDuration">0.0 hrs driving</div>
-                    </div>
-                    <div class="kpi-card">
-                        <div class="kpi-label"><i class="fa-solid fa-gas-pump"></i> Fuel Stops</div>
-                        <div class="kpi-value" id="kpiStops">0</div>
-                        <div class="kpi-sub" id="kpiMaxLeg">Max leg &le; 500 mi</div>
-                    </div>
-                    <div class="kpi-card">
-                        <div class="kpi-label"><i class="fa-solid fa-oil-can"></i> Total Fuel</div>
-                        <div class="kpi-value" id="kpiGallons">0 gal</div>
-                        <div class="kpi-sub">@ 10.0 MPG</div>
-                    </div>
-                </div>
-
-                <!-- API Stats Toast -->
-                <div class="api-meta-bar">
-                    <span><i class="fa-solid fa-bolt"></i> Engine response in <strong id="kpiTime">0</strong> ms</span>
-                    <span><i class="fa-solid fa-server"></i> 1 Route API call</span>
-                </div>
-
-                <!-- Step-by-Step Fuel Itinerary -->
-                <div class="itinerary-header">
-                    <h3><i class="fa-solid fa-list-check"></i> Refueling Plan</h3>
-                    <span id="itineraryCountBadge" class="badge">0 stops</span>
-                </div>
-
-                <div id="itineraryList" class="itinerary-list">
-                    <!-- Populated dynamically by JavaScript -->
-                </div>
-
-                <!-- Direct API curl modal trigger -->
-                <div class="api-snippet-card">
-                    <div class="snippet-header">
-                        <span><i class="fa-solid fa-terminal"></i> cURL Request (Try in Terminal / Postman)</span>
-                        <button id="copyCurlBtn" class="btn-copy"><i class="fa-regular fa-copy"></i> Copy</button>
-                    </div>
-                    <pre><code id="curlCode">curl "http://127.0.0.1:8000/api/route/?start=New+York,NY&finish=Los+Angeles,CA"</code></pre>
-                </div>
-            </section>
-        </aside>
-
-        <!-- Main Map Display -->
-        <main class="map-wrapper">
-            <div id="map"></div>
-            
-            <!-- Map Overlay Controls -->
-            <div class="map-floating-overlay">
-                <button id="fitRouteBtn" class="map-ctrl-btn" title="Fit Entire Route"><i class="fa-solid fa-expand"></i> Fit Route</button>
-                <div class="legend-card">
-                    <div class="legend-item"><span class="legend-dot start-dot"></span> Origin</div>
-                    <div class="legend-item"><span class="legend-dot stop-dot"></span> Fuel Stop</div>
-                    <div class="legend-item"><span class="legend-dot finish-dot"></span> Destination</div>
                 </div>
             </div>
-        </main>
-    </div>
 
-    <!-- Leaflet JS -->
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-    <script src="/static/js/app.js"></script>
+            <dl class="markers">
+                <div><dt>Distance</dt><dd id="kpiDistance">—</dd></div>
+                <div><dt>Drive time</dt><dd id="kpiDuration">—</dd></div>
+                <div><dt>Fuel stops</dt><dd id="kpiStops">—</dd></div>
+            </dl>
+            <p class="fineprint" id="kpiRange"></p>
+
+            <div class="road-card">
+                <div class="road-head">
+                    <h2>The road</h2>
+                    <span id="timelineCaption"></span>
+                </div>
+                <div class="road" id="timeline" role="img" aria-label="Fuel stops along the route"></div>
+                <div class="road-scale"><span>MILE 0</span><span id="timelineEnd"></span></div>
+            </div>
+
+            <div class="plan-head">
+                <h2>Refueling plan</h2>
+                <span id="stopsBadge"></span>
+            </div>
+            <ol id="itinerary" class="itinerary"></ol>
+
+            <div class="ticket">
+                <div class="ticket-head">
+                    <span>Same request · API</span>
+                    <button type="button" id="copyCurlBtn">Copy</button>
+                </div>
+                <pre><code id="curlCode"></code></pre>
+                <div class="ticket-meta">
+                    <span><b id="metaTime">0</b> ms server</span>
+                    <span><b id="metaCalls">1</b></span>
+                    <span><b id="metaStations">0</b> stations checked</span>
+                </div>
+            </div>
+        </section>
+
+        <footer class="colophon">
+            Prices — OPIS truck-stop list · Routing — OSRM · Map — © OpenStreetMap contributors
+        </footer>
+    </aside>
+
+    <main class="map-wrap">
+        <div id="map"></div>
+        <div class="map-overlay">
+            <button type="button" id="fitRouteBtn" class="map-btn hidden" title="Zoom to the whole route">⤢ Whole route</button>
+            <div class="legend">
+                <span><i class="lg lg-start"></i>Origin</span>
+                <span><i class="lg lg-fuel"></i>Fuel</span>
+                <span><i class="lg lg-finish"></i>Destination</span>
+            </div>
+        </div>
+        <div id="mapLoading" class="map-loading hidden">
+            <span>Routing &amp; pricing</span>
+            <div class="loading-road"></div>
+        </div>
+    </main>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script src="{% static 'js/app.js' %}"></script>
 </body>
 </html>

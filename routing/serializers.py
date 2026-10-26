@@ -37,6 +37,10 @@ class RouteRequestSerializer(serializers.Serializer):
 
 class FuelStopSerializer(serializers.Serializer):
     stop_number = serializers.IntegerField(help_text="Sequential stop number along route")
+    stop_type = serializers.ChoiceField(
+        choices=['origin', 'en_route'],
+        help_text="'origin' = initial fill-up at the station nearest the start; 'en_route' = stop along the route"
+    )
     opis_id = serializers.IntegerField(help_text="OPIS Truckstop ID")
     name = serializers.CharField(help_text="Station brand/name")
     address = serializers.CharField(help_text="Physical address or highway exit")
@@ -45,7 +49,8 @@ class FuelStopSerializer(serializers.Serializer):
     retail_price = serializers.FloatField(help_text="Retail fuel price ($/gallon)")
     route_mile = serializers.FloatField(help_text="Distance from route start in miles")
     leg_distance_miles = serializers.FloatField(help_text="Distance driven since previous stop/origin")
-    gallons_pumped = serializers.FloatField(help_text="Gallons refueled at this stop")
+    fuel_on_arrival_gallons = serializers.FloatField(help_text="Fuel left in the tank when arriving at this stop")
+    gallons_pumped = serializers.FloatField(help_text="Gallons bought at this stop (only what the optimal plan needs)")
     cost_at_stop = serializers.FloatField(help_text="Total money spent at this stop ($)")
     miles_off_route = serializers.FloatField(help_text="Perpendicular distance from highway path in miles")
     latitude = serializers.FloatField()
@@ -57,6 +62,14 @@ class LocationPointSerializer(serializers.Serializer):
     display_name = serializers.CharField()
     latitude = serializers.FloatField()
     longitude = serializers.FloatField()
+
+
+class RouteMetaSerializer(serializers.Serializer):
+    routing_api_calls = serializers.IntegerField(help_text="External routing API calls made by this request (1, or 0 when cached)")
+    route_cache_hit = serializers.BooleanField()
+    stations_considered = serializers.IntegerField(help_text="Fuel stations within the search corridor")
+    search_corridor_miles = serializers.FloatField(help_text="Corridor width actually used (auto-widened for sparse routes)")
+    optimization_time_ms = serializers.FloatField()
 
 
 class RouteResponseSerializer(serializers.Serializer):
@@ -71,8 +84,10 @@ class RouteResponseSerializer(serializers.Serializer):
     vehicle_specs = serializers.DictField(help_text="Vehicle range and fuel economy parameters")
     fuel_stops_count = serializers.IntegerField(help_text="Number of fuel stops on route")
     fuel_stops = FuelStopSerializer(many=True, help_text="Optimal fuel stop locations and details")
+    final_leg_miles = serializers.FloatField(help_text="Distance from the last fuel stop to the destination")
     route_geometry = serializers.DictField(help_text="GeoJSON LineString coordinates for rendering the map")
     interactive_map_url = serializers.CharField(help_text="URL to view the visual interactive Leaflet map")
+    meta = RouteMetaSerializer()
     api_execution_time_ms = serializers.FloatField(help_text="Total API processing time in milliseconds")
 
 

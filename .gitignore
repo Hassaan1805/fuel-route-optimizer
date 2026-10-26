@@ -10,3 +10,5 @@ htmlcov/
 *.log
 local_settings.py
 .env
+.cache/
+staticfiles/

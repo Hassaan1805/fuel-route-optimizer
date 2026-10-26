@@ -1,8 +1,8 @@
 {
   "info": {
     "_postman_id": "c1f7b920-8e12-4293-8472-a9b1c7d2e4f0",
-    "name": "FuelPath AI - Optimal Fuel Routing API",
-    "description": "Production Postman Collection for demonstrating the Optimal Fuel Routing API in Django.\nComputes cost-effective fuel stops along routes in the USA using real OPIS retail fuel prices.",
+    "name": "FuelPath - Optimal Fuel Routing API",
+    "description": "Requests for the Optimal Fuel Routing API (Django + DRF).\nEach route request has tests that check the plan: every leg is within the vehicle range, stop costs add up to total_fuel_cost, and at most one external routing call was made.\nSet the baseUrl variable to wherever the server runs (default http://127.0.0.1:8000).",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -58,7 +58,34 @@
         },
         "description": "Computes optimal fuel stops for ~2,790 mile coast-to-coast route from New York to Los Angeles."
       },
-      "response": []
+      "response": [],
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "const data = pm.response.json();",
+              "pm.test('Plan found', () => pm.expect(data.success).to.be.true);",
+              "pm.test('At most one routing API call', () => pm.expect(data.meta.routing_api_calls).to.be.at.most(1));",
+              "pm.test('Every leg within vehicle range', () => {",
+              "    const range = data.vehicle_specs.max_vehicle_range_miles;",
+              "    data.fuel_stops.forEach(s => pm.expect(s.leg_distance_miles).to.be.at.most(range));",
+              "    pm.expect(data.final_leg_miles).to.be.at.most(range);",
+              "});",
+              "pm.test('Stop costs add up to total', () => {",
+              "    const sum = data.fuel_stops.reduce((acc, s) => acc + s.cost_at_stop, 0);",
+              "    pm.expect(sum).to.be.closeTo(data.total_fuel_cost, 0.01);",
+              "});",
+              "pm.test('Gallons = distance / mpg', () => {",
+              "    const expected = data.total_distance_miles / data.vehicle_specs.fuel_efficiency_mpg;",
+              "    pm.expect(data.total_fuel_gallons).to.be.closeTo(expected, 0.2);",
+              "});"
+            ]
+          }
+        }
+      ]
     },
     {
       "name": "2. Mid-Distance Route (Chicago to Miami - POST JSON)",
@@ -91,10 +118,37 @@
         },
         "description": "Calculates fuel stops for ~1,380 mile route from Chicago, IL to Miami, FL using JSON POST body."
       },
-      "response": []
+      "response": [],
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "const data = pm.response.json();",
+              "pm.test('Plan found', () => pm.expect(data.success).to.be.true);",
+              "pm.test('At most one routing API call', () => pm.expect(data.meta.routing_api_calls).to.be.at.most(1));",
+              "pm.test('Every leg within vehicle range', () => {",
+              "    const range = data.vehicle_specs.max_vehicle_range_miles;",
+              "    data.fuel_stops.forEach(s => pm.expect(s.leg_distance_miles).to.be.at.most(range));",
+              "    pm.expect(data.final_leg_miles).to.be.at.most(range);",
+              "});",
+              "pm.test('Stop costs add up to total', () => {",
+              "    const sum = data.fuel_stops.reduce((acc, s) => acc + s.cost_at_stop, 0);",
+              "    pm.expect(sum).to.be.closeTo(data.total_fuel_cost, 0.01);",
+              "});",
+              "pm.test('Gallons = distance / mpg', () => {",
+              "    const expected = data.total_distance_miles / data.vehicle_specs.fuel_efficiency_mpg;",
+              "    pm.expect(data.total_fuel_gallons).to.be.closeTo(expected, 0.2);",
+              "});"
+            ]
+          }
+        }
+      ]
     },
     {
-      "name": "3. West Coast Route (Seattle to San Diego - GET)",
+      "name": "3. Data-Gap Route (Seattle to San Diego) - expects 422",
       "request": {
         "method": "GET",
         "header": [
@@ -132,12 +186,24 @@
             }
           ]
         },
-        "description": "Computes optimal fuel stops along the I-5 corridor on the West Coast (~1,255 miles)."
+        "description": "The provided price list has almost no stations in California/Oregon, so I-5 has a ~1,000-mile stretch with no fuel. The API returns 422 with the exact gap instead of a bad plan."
       },
-      "response": []
+      "response": [],
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status 422 (no stations in the price list along I-5 in CA/OR)', () => pm.response.to.have.status(422));",
+              "pm.test('Explains the gap', () => pm.expect(pm.response.json().error).to.include('no stations between'));"
+            ]
+          }
+        }
+      ]
     },
     {
-      "name": "4. Short Route (Austin to Dallas - Under 500 Miles Range)",
+      "name": "4. Short Route (Austin to Dallas - under 500 miles)",
       "request": {
         "method": "GET",
         "header": [
@@ -177,7 +243,34 @@
         },
         "description": "Demonstrates behavior for routes under 500 miles where 0 fuel stops are required to reach destination."
       },
-      "response": []
+      "response": [],
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "const data = pm.response.json();",
+              "pm.test('Plan found', () => pm.expect(data.success).to.be.true);",
+              "pm.test('At most one routing API call', () => pm.expect(data.meta.routing_api_calls).to.be.at.most(1));",
+              "pm.test('Every leg within vehicle range', () => {",
+              "    const range = data.vehicle_specs.max_vehicle_range_miles;",
+              "    data.fuel_stops.forEach(s => pm.expect(s.leg_distance_miles).to.be.at.most(range));",
+              "    pm.expect(data.final_leg_miles).to.be.at.most(range);",
+              "});",
+              "pm.test('Stop costs add up to total', () => {",
+              "    const sum = data.fuel_stops.reduce((acc, s) => acc + s.cost_at_stop, 0);",
+              "    pm.expect(sum).to.be.closeTo(data.total_fuel_cost, 0.01);",
+              "});",
+              "pm.test('Gallons = distance / mpg', () => {",
+              "    const expected = data.total_distance_miles / data.vehicle_specs.fuel_efficiency_mpg;",
+              "    pm.expect(data.total_fuel_gallons).to.be.closeTo(expected, 0.2);",
+              "});"
+            ]
+          }
+        }
+      ]
     },
     {
       "name": "5. Direct GPS Coordinates Route",
@@ -220,7 +313,34 @@
         },
         "description": "Accepts direct lat,lon coordinate pairs."
       },
-      "response": []
+      "response": [],
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "const data = pm.response.json();",
+              "pm.test('Plan found', () => pm.expect(data.success).to.be.true);",
+              "pm.test('At most one routing API call', () => pm.expect(data.meta.routing_api_calls).to.be.at.most(1));",
+              "pm.test('Every leg within vehicle range', () => {",
+              "    const range = data.vehicle_specs.max_vehicle_range_miles;",
+              "    data.fuel_stops.forEach(s => pm.expect(s.leg_distance_miles).to.be.at.most(range));",
+              "    pm.expect(data.final_leg_miles).to.be.at.most(range);",
+              "});",
+              "pm.test('Stop costs add up to total', () => {",
+              "    const sum = data.fuel_stops.reduce((acc, s) => acc + s.cost_at_stop, 0);",
+              "    pm.expect(sum).to.be.closeTo(data.total_fuel_cost, 0.01);",
+              "});",
+              "pm.test('Gallons = distance / mpg', () => {",
+              "    const expected = data.total_distance_miles / data.vehicle_specs.fuel_efficiency_mpg;",
+              "    pm.expect(data.total_fuel_gallons).to.be.closeTo(expected, 0.2);",
+              "});"
+            ]
+          }
+        }
+      ]
     },
     {
       "name": "6. Search Fuel Stations Database",

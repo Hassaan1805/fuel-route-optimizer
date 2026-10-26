@@ -1,330 +1,377 @@
 /**
- * FuelPath AI - Frontend Application Logic
- * Integrates with Django REST API, renders Leaflet.js interactive maps,
- * manages refueling itinerary, and supports 1-click presets and Postman exports.
+ * FuelPath — frontend for the /api/route/ endpoint.
+ * Draws the route and fuel stops on a Leaflet map and renders the refueling plan.
  */
 
 document.addEventListener('DOMContentLoaded', () => {
-    // 1. Initialize Leaflet Map
-    const map = L.map('map', {
-        zoomControl: false,
-        attributionControl: true
-    }).setView([39.8283, -98.5795], 4); // Center of Continental USA
+    const $ = (id) => document.getElementById(id);
 
-    // Add zoom control at bottom right
+    // ---------- Map ----------
+    const map = L.map('map', { zoomControl: false, zoomSnap: 0.25 }).setView([39.8283, -98.5795], 4);
     L.control.zoom({ position: 'bottomright' }).addTo(map);
 
-    // 100% Free OpenStreetMap & Esri basemap layers (Zero API key required, no watermarks)
-    const osmStandard = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    // OSM's tile usage policy rejects requests without a Referer, and Django's
+    // default Referrer-Policy (same-origin) strips it from cross-site requests.
+    const tileOptions = { referrerPolicy: 'strict-origin-when-cross-origin' };
+    const osm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        ...tileOptions,
         maxZoom: 19,
         attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a> contributors'
     });
-
-    const esriDark = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}', {
-        maxZoom: 16,
-        attribution: 'Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ'
-    });
-
-    const esriStreets = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', {
+    const esriTopo = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}', {
+        ...tileOptions,
         maxZoom: 19,
-        attribution: 'Tiles &copy; Esri &mdash; Source: Esri, DeLorme, NAVTEQ, USGS'
+        attribution: 'Tiles &copy; Esri'
     });
+    const esriStreets = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', {
+        ...tileOptions,
+        maxZoom: 19,
+        attribution: 'Tiles &copy; Esri'
+    });
+    osm.addTo(map);
+    L.control.layers({ 'Road atlas': osm, 'Topographic': esriTopo, 'Streets': esriStreets }, null, { position: 'topright' }).addTo(map);
 
-    // Default to OpenStreetMap Standard
-    osmStandard.addTo(map);
+    // Leaflet measures its container once; re-measure when the layout changes
+    // (panel stacking on small screens) so tiles and fitBounds stay correct.
+    new ResizeObserver(() => map.invalidateSize()).observe($('map'));
 
-    // Layer switcher control (top-right)
-    const baseLayers = {
-        "🗺️ OpenStreetMap": osmStandard,
-        "🌙 Dark Mode": esriDark,
-        "🛣️ Streets": esriStreets
-    };
-    L.control.layers(baseLayers, null, { position: 'topright' }).addTo(map);
-
-    // Layer groups for dynamic map elements
-    let routeLayer = null;
-    let markersLayer = L.layerGroup().addTo(map);
-
-    // DOM Elements
-    const routeForm = document.getElementById('routeForm');
-    const startInput = document.getElementById('startInput');
-    const finishInput = document.getElementById('finishInput');
-    const rangeInput = document.getElementById('rangeInput');
-    const mpgInput = document.getElementById('mpgInput');
-    const submitBtn = document.getElementById('submitBtn');
-    const btnText = submitBtn.querySelector('.btn-text');
-    const btnSpinner = submitBtn.querySelector('.btn-spinner');
-
-    const resultsSection = document.getElementById('resultsSection');
-    const kpiCost = document.getElementById('kpiCost');
-    const kpiAvgPrice = document.getElementById('kpiAvgPrice');
-    const kpiDistance = document.getElementById('kpiDistance');
-    const kpiDuration = document.getElementById('kpiDuration');
-    const kpiStops = document.getElementById('kpiStops');
-    const kpiGallons = document.getElementById('kpiGallons');
-    const kpiTime = document.getElementById('kpiTime');
-    const itineraryList = document.getElementById('itineraryList');
-    const itineraryCountBadge = document.getElementById('itineraryCountBadge');
-    const curlCode = document.getElementById('curlCode');
-    const copyCurlBtn = document.getElementById('copyCurlBtn');
-    const fitRouteBtn = document.getElementById('fitRouteBtn');
-    const downloadPostmanBtn = document.getElementById('downloadPostmanBtn');
-
-    // Store current route stops for click-to-zoom
-    let currentFuelStops = [];
+    const routeLayer = L.layerGroup().addTo(map);
+    const markerLayer = L.layerGroup().addTo(map);
+    let routeBounds = null;
     let stopMarkers = {};
 
-    // Custom Icon Creators
-    function createCustomPin(type, content = '') {
-        const className = `custom-pin pin-${type}`;
+    // ---------- DOM ----------
+    const form = $('routeForm');
+    const startInput = $('startInput');
+    const finishInput = $('finishInput');
+    const rangeInput = $('rangeInput');
+    const mpgInput = $('mpgInput');
+    const submitBtn = $('submitBtn');
+    let activeRequest = null;
+
+    const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+    const money = (n) => n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const miles = (n) => `${Math.round(n).toLocaleString('en-US')} mi`;
+    const hours = (h) => `${Math.floor(h)}h ${String(Math.round((h % 1) * 60)).padStart(2, '0')}m`;
+    const ghost = (text) => text.replace(/\d/g, '8');
+    // Gas-station style price: 2.79⁹
+    const pylonPrice = (p) => {
+        const s = p.toFixed(3);
+        return `${s.slice(0, -1)}<span class="cents">${s.slice(-1)}</span>`;
+    };
+
+    function setLcd(el, text) {
+        el.textContent = text;
+        el.dataset.ghost = ghost(text);
+    }
+
+    function pinIcon(kind, label = '') {
+        const sizes = { start: [24, 24], finish: [26, 26], fuel: [30, 26], 'origin-fuel': [30, 26] };
+        const [w, h] = sizes[kind];
+        const isFuel = kind.includes('fuel');
         return L.divIcon({
-            className: 'leaflet-div-icon',
-            html: `<div class="${className}" style="width: 30px; height: 30px; font-size: 13px;">${content}</div>`,
-            iconSize: [30, 30],
-            iconAnchor: [15, 15],
-            popupAnchor: [0, -15]
+            className: 'pin-icon',
+            html: `<div class="pin pin-${kind}${isFuel ? ' pin-fuel' : ''}">${label}</div>`,
+            iconSize: [w, h],
+            iconAnchor: isFuel ? [w / 2, h + 5] : [w / 2, h / 2],
+            popupAnchor: [0, isFuel ? -h - 4 : -h / 2]
         });
     }
 
-    // 2. Fetch and render route
-    async function calculateRoute(start, finish, maxRange, mpg) {
-        setLoading(true);
-
-        const params = new URLSearchParams({
-            start: start,
-            finish: finish,
-            max_range: maxRange,
-            mpg: mpg
-        });
-
-        // Update URL query parameters without reloading
-        const newUrl = `${window.location.pathname}?${params.toString()}`;
-        window.history.replaceState({}, '', newUrl);
-
-        // Update cURL snippet
-        const curlUrl = `${window.location.origin}/api/route/?${params.toString()}`;
-        curlCode.innerText = `curl "${curlUrl}"`;
-
-        try {
-            const response = await fetch(`/api/route/?${params.toString()}`);
-            const data = await response.json();
-
-            if (!response.ok || !data.success) {
-                const errMsg = data.error || (data.errors ? JSON.stringify(data.errors) : 'Route calculation failed.');
-                alert(`Error: ${errMsg}`);
-                setLoading(false);
-                return;
-            }
-
-            renderRouteOnMap(data);
-            populateDashboard(data);
-            resultsSection.classList.remove('hidden');
-        } catch (err) {
-            console.error('API Error:', err);
-            alert(`Network or Server error: ${err.message}`);
-        } finally {
-            setLoading(false);
-        }
+    // ---------- Request ----------
+    function readParams() {
+        return {
+            start: startInput.value.trim(),
+            finish: finishInput.value.trim(),
+            max_range: parseFloat(rangeInput.value) || 500,
+            mpg: parseFloat(mpgInput.value) || 10
+        };
     }
 
-    function setLoading(isLoading) {
-        if (isLoading) {
-            btnText.classList.add('hidden');
-            btnSpinner.classList.remove('hidden');
-            submitBtn.disabled = true;
-        } else {
-            btnText.classList.remove('hidden');
-            btnSpinner.classList.add('hidden');
-            submitBtn.disabled = false;
-        }
-    }
-
-    // 3. Render Leaflet Map Elements
-    function renderRouteOnMap(data) {
-        // Clear previous layers
-        if (routeLayer) {
-            map.removeLayer(routeLayer);
-        }
-        markersLayer.clearLayers();
-        stopMarkers = {};
-
-        // Draw Route Polyline
-        routeLayer = L.geoJSON(data.route_geometry, {
-            style: {
-                color: '#6366f1',
-                weight: 5,
-                opacity: 0.85,
-                lineCap: 'round',
-                lineJoin: 'round'
-            }
-        }).addTo(map);
-
-        // Add Origin Marker (Green Pin)
-        const startCoord = [data.start.latitude, data.start.longitude];
-        const startMarker = L.marker(startCoord, {
-            icon: createCustomPin('start', '<i class="fa-solid fa-play"></i>')
-        }).bindPopup(`
-            <div class="popup-station-title"><i class="fa-solid fa-location-dot" style="color: #10b981;"></i> Origin</div>
-            <div class="popup-station-addr">${data.start.display_name}</div>
-        `).addTo(markersLayer);
-
-        // Add Destination Marker (Red Pin)
-        const finishCoord = [data.finish.latitude, data.finish.longitude];
-        const finishMarker = L.marker(finishCoord, {
-            icon: createCustomPin('finish', '<i class="fa-solid fa-flag-checkered"></i>')
-        }).bindPopup(`
-            <div class="popup-station-title"><i class="fa-solid fa-flag-checkered" style="color: #f43f5e;"></i> Destination</div>
-            <div class="popup-station-addr">${data.finish.display_name}</div>
-        `).addTo(markersLayer);
-
-        // Add Fuel Stop Markers (Amber Pins)
-        currentFuelStops = data.fuel_stops || [];
-        currentFuelStops.forEach((stop) => {
-            const stopCoord = [stop.latitude, stop.longitude];
-            const stopMarker = L.marker(stopCoord, {
-                icon: createCustomPin('fuel', stop.stop_number)
-            }).bindPopup(`
-                <div class="popup-station-title">
-                    <span style="color: #f59e0b;">Stop #${stop.stop_number}:</span> ${stop.name}
-                </div>
-                <div class="popup-station-addr">${stop.address}, ${stop.city}, ${stop.state}</div>
-                <div class="popup-station-price">$${stop.retail_price.toFixed(3)} <span style="font-size: 11px; font-weight: normal; color: #94a3b8;">/ gal</span></div>
-                <div class="popup-station-metrics">
-                    <div><strong>Pumped:</strong> ${stop.gallons_pumped.toFixed(1)} gal</div>
-                    <div><strong>Cost:</strong> $${stop.cost_at_stop.toFixed(2)}</div>
-                    <div><strong>Mile Marker:</strong> ${stop.route_mile.toFixed(1)} mi</div>
-                    <div><strong>Leg Distance:</strong> ${stop.leg_distance_miles.toFixed(1)} mi</div>
-                </div>
-            `).addTo(markersLayer);
-
-            stopMarkers[stop.stop_number] = stopMarker;
-        });
-
-        // Fit Map to bounds
-        fitRouteBounds();
-    }
-
-    function fitRouteBounds() {
-        if (routeLayer) {
-            map.fitBounds(routeLayer.getBounds(), { padding: [60, 60] });
-        }
-    }
-
-    // 4. Populate UI Cards and Itinerary
-    function populateDashboard(data) {
-        kpiCost.innerText = `$${data.total_fuel_cost.toFixed(2)}`;
-        kpiAvgPrice.innerText = `Avg: $${data.average_price_per_gallon.toFixed(3)} / gal`;
-        kpiDistance.innerText = `${data.total_distance_miles.toFixed(1)} mi`;
-        kpiDuration.innerText = `${data.total_duration_hours.toFixed(1)} hrs driving`;
-        kpiStops.innerText = data.fuel_stops_count;
-        kpiGallons.innerText = `${data.total_fuel_gallons.toFixed(1)} gal`;
-        kpiTime.innerText = data.api_execution_time_ms;
-
-        itineraryCountBadge.innerText = `${data.fuel_stops_count} stop${data.fuel_stops_count === 1 ? '' : 's'}`;
-
-        // Populate Itinerary List
-        itineraryList.innerHTML = '';
-        if (data.fuel_stops_count === 0) {
-            itineraryList.innerHTML = `
-                <div class="stop-card" style="border-left-color: #10b981;">
-                    <div class="stop-card-header">
-                        <div class="stop-title">
-                            <span class="stop-badge" style="background: #10b981; color: #fff;"><i class="fa-solid fa-check"></i></span>
-                            <span class="stop-name">Direct Trip - No Fuel Stops Required</span>
-                        </div>
-                    </div>
-                    <div class="stop-meta">
-                        Total distance of ${data.total_distance_miles.toFixed(1)} miles is within your vehicle's ${data.vehicle_specs.max_vehicle_range_miles} mile range.
-                    </div>
-                </div>
-            `;
+    async function calculateRoute() {
+        const params = readParams();
+        if (!params.start || !params.finish) {
+            showError('Enter both an origin and a destination.');
             return;
         }
 
+        const query = new URLSearchParams(params).toString();
+        window.history.replaceState({}, '', `${window.location.pathname}?${query}`);
+
+        activeRequest?.abort();
+        const controller = new AbortController();
+        activeRequest = controller;
+        setLoading(true);
+        hideError();
+
+        try {
+            const response = await fetch(`/api/route/?${query}`, { signal: controller.signal });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok || !data.success) {
+                showError(data.error || formatFieldErrors(data.errors) || `Request failed (HTTP ${response.status}).`);
+                return;
+            }
+            renderMap(data);
+            renderResults(data, query);
+        } catch (err) {
+            if (err.name !== 'AbortError') showError(`Could not reach the server: ${err.message}`);
+        } finally {
+            if (activeRequest === controller) setLoading(false);
+        }
+    }
+
+    function formatFieldErrors(errors) {
+        if (!errors) return '';
+        return Object.entries(errors).map(([field, msgs]) => `${field}: ${[].concat(msgs).join(' ')}`).join(' · ');
+    }
+
+    function setLoading(isLoading) {
+        submitBtn.disabled = isLoading;
+        submitBtn.querySelector('.btn-label').classList.toggle('hidden', isLoading);
+        submitBtn.querySelector('.btn-busy').classList.toggle('hidden', !isLoading);
+        $('mapLoading').classList.toggle('hidden', !isLoading);
+    }
+
+    function showError(message) {
+        $('errorText').textContent = message;
+        $('errorBox').classList.remove('hidden');
+        $('results').classList.add('hidden');
+        routeLayer.clearLayers();
+        markerLayer.clearLayers();
+        $('fitRouteBtn').classList.add('hidden');
+    }
+
+    function hideError() {
+        $('errorBox').classList.add('hidden');
+    }
+
+    // ---------- Map rendering ----------
+    function renderMap(data) {
+        routeLayer.clearLayers();
+        markerLayer.clearLayers();
+        stopMarkers = {};
+
+        // Drawn as a road: dark asphalt with a dashed amber center line
+        L.geoJSON(data.route_geometry, { style: { color: '#17150f', weight: 9, opacity: 0.9, lineCap: 'round', lineJoin: 'round' } }).addTo(routeLayer);
+        L.geoJSON(data.route_geometry, { style: { color: '#3a3832', weight: 6, opacity: 1, lineCap: 'round', lineJoin: 'round' } }).addTo(routeLayer);
+        const center = L.geoJSON(data.route_geometry, { style: { color: '#f2a900', weight: 2, opacity: 1, dashArray: '6 8' } }).addTo(routeLayer);
+        routeBounds = center.getBounds();
+
+        L.marker([data.start.latitude, data.start.longitude], { icon: pinIcon('start', '▶'), zIndexOffset: 500 })
+            .bindPopup(`<div class="popup-title">Origin</div><div class="popup-sub">${escapeHtml(data.start.display_name)}</div>`)
+            .addTo(markerLayer);
+        L.marker([data.finish.latitude, data.finish.longitude], { icon: pinIcon('finish'), zIndexOffset: 500 })
+            .bindPopup(`<div class="popup-title">Destination</div><div class="popup-sub">${escapeHtml(data.finish.display_name)}</div>`)
+            .addTo(markerLayer);
+
         data.fuel_stops.forEach((stop) => {
-            const card = document.createElement('div');
-            card.className = 'stop-card';
-            card.innerHTML = `
-                <div class="stop-card-header">
-                    <div class="stop-title">
-                        <span class="stop-badge">${stop.stop_number}</span>
-                        <span class="stop-name" title="${stop.name}">${stop.name}</span>
+            const kind = stop.stop_type === 'origin' ? 'origin-fuel' : 'fuel';
+            stopMarkers[stop.stop_number] = L.marker([stop.latitude, stop.longitude], { icon: pinIcon(kind, stop.stop_number), zIndexOffset: 1000 })
+                .bindPopup(stopPopup(stop))
+                .addTo(markerLayer);
+        });
+
+        $('fitRouteBtn').classList.remove('hidden');
+        fitRoute();
+    }
+
+    function stopPopup(stop) {
+        return `
+            <div class="popup-title">${stop.stop_number}. ${escapeHtml(stop.name)}</div>
+            <div class="popup-sub">${escapeHtml([stop.address, stop.city, stop.state].filter(Boolean).join(', '))}</div>
+            <div class="popup-price">$${stop.retail_price.toFixed(3)}</div>
+            <div class="popup-grid">
+                <span>Buy <b>${stop.gallons_pumped.toFixed(1)} gal</b></span>
+                <span>Pay <b>$${money(stop.cost_at_stop)}</b></span>
+                <span>Mile <b>${Math.round(stop.route_mile)}</b></span>
+                <span>Off route <b>${stop.miles_off_route.toFixed(1)} mi</b></span>
+            </div>`;
+    }
+
+    function fitRoute() {
+        if (routeBounds) map.fitBounds(routeBounds, { padding: [56, 56] });
+    }
+
+    // ---------- Panel rendering ----------
+    function renderResults(data, query) {
+        const specs = data.vehicle_specs;
+        const stops = data.fuel_stops;
+
+        setLcd($('kpiCost'), money(data.total_fuel_cost));
+        setLcd($('kpiGallons'), data.total_fuel_gallons.toFixed(1));
+        setLcd($('kpiAvgPrice'), data.average_price_per_gallon.toFixed(3));
+        $('kpiDistance').textContent = miles(data.total_distance_miles);
+        $('kpiDuration').textContent = hours(data.total_duration_hours);
+        $('kpiStops').textContent = stops.length;
+        $('kpiRange').textContent =
+            `${specs.max_vehicle_range_miles} mi range · ${specs.tank_capacity_gallons} gal tank · ${specs.fuel_efficiency_mpg} mpg`;
+
+        const calls = data.meta.routing_api_calls;
+        $('metaTime').textContent = Math.round(data.api_execution_time_ms);
+        $('metaCalls').textContent = calls === 0 ? '0 routing calls (cached)' : `${calls} routing call`;
+        $('metaStations').textContent = data.meta.stations_considered;
+
+        $('stopsBadge').textContent = `${stops.length} stop${stops.length === 1 ? '' : 's'}`;
+        renderRoad(data);
+        renderItinerary(data);
+
+        $('curlCode').textContent = `curl "${window.location.origin}/api/route/?${query}"`;
+        $('results').classList.remove('hidden');
+    }
+
+    function renderRoad(data) {
+        const total = data.total_distance_miles;
+        const pct = (mile) => Math.min(100, Math.max(0, (mile / total) * 100));
+        const road = $('timeline');
+        road.innerHTML = '<div class="road-dash"></div>';
+
+        // Shade how far each fill-up carries the truck
+        const mpg = data.vehicle_specs.fuel_efficiency_mpg;
+        data.fuel_stops.forEach((stop) => {
+            const reach = Math.min(total, stop.route_mile + (stop.fuel_on_arrival_gallons + stop.gallons_pumped) * mpg);
+            const band = document.createElement('div');
+            band.className = 'road-fuel';
+            band.style.left = `${pct(stop.route_mile)}%`;
+            band.style.width = `${pct(reach) - pct(stop.route_mile)}%`;
+            road.appendChild(band);
+        });
+
+        const addPin = (mile, cls, label, title, onClick) => {
+            const pin = document.createElement(onClick ? 'button' : 'span');
+            pin.className = `road-pin ${cls}`;
+            pin.style.left = `${pct(mile)}%`;
+            pin.textContent = label;
+            pin.title = title;
+            if (onClick) {
+                pin.type = 'button';
+                pin.addEventListener('click', onClick);
+            }
+            road.appendChild(pin);
+        };
+        addPin(total, 'pin-finish', '■', 'Destination');
+        data.fuel_stops.forEach((stop) => addPin(
+            stop.route_mile, stop.stop_type === 'origin' ? 'pin-start' : '', stop.stop_number,
+            `${stop.stop_number}. ${stop.city}, ${stop.state} — mile ${Math.round(stop.route_mile)}, $${stop.retail_price.toFixed(3)}/gal`,
+            () => focusStop(stop.stop_number)
+        ));
+
+        $('timelineEnd').textContent = `MILE ${Math.round(total).toLocaleString('en-US')}`;
+        const longestLeg = Math.max(...data.fuel_stops.map((s) => s.leg_distance_miles), data.final_leg_miles);
+        $('timelineCaption').textContent = `longest leg ${miles(longestLeg)}`;
+    }
+
+    function renderItinerary(data) {
+        const items = [];
+        let i = 0;
+        const place = (geo) => escapeHtml(geo.display_name.replace(/, USA$|, United States$/, ''));
+
+        items.push(`
+            <li style="--i:${i++}">
+                <div class="guide">
+                    <div><span class="label">Origin · tank empty</span><span class="place">${place(data.start)}</span></div>
+                    <span class="dist">MILE 0</span>
+                </div>
+            </li>`);
+
+        data.fuel_stops.forEach((stop) => {
+            const isOrigin = stop.stop_type === 'origin';
+            const tab = isOrigin ? 'Fill-up near origin' : `Exit · mile ${Math.round(stop.route_mile).toLocaleString('en-US')}`;
+            const arrive = isOrigin
+                ? `${stop.miles_off_route.toFixed(1)} mi from start`
+                : `arrive <b>${stop.fuel_on_arrival_gallons.toFixed(1)}</b> gal`;
+            if (!isOrigin) {
+                items.push(`<li class="connector" style="--i:${i++}">${miles(stop.leg_distance_miles)}</li>`);
+            }
+            items.push(`
+                <li class="stop is-clickable ${isOrigin ? 'stop-origin' : ''}" data-stop="${stop.stop_number}" style="--i:${i++}">
+                    <div class="sign" tabindex="0" role="button" aria-label="Show stop ${stop.stop_number} on the map">
+                        <span class="exit-tab">${stop.stop_number} · ${tab}</span>
+                        <div class="sign-inner">
+                            <div class="sign-title" title="${escapeHtml(stop.name)}">${escapeHtml(stop.name)}</div>
+                            <div class="sign-sub">${escapeHtml([stop.address, `${stop.city}, ${stop.state}`].filter(Boolean).join(' · '))}</div>
+                            <div class="sign-stats">
+                                <span>${arrive}</span>
+                                <span>buy <b>${stop.gallons_pumped.toFixed(1)}</b> gal</span>
+                                <span>pay <b>$${money(stop.cost_at_stop)}</b></span>
+                            </div>
+                        </div>
+                        <div class="pylon">
+                            <small>Diesel</small>
+                            <span class="lcd">${pylonPrice(stop.retail_price)}</span>
+                        </div>
                     </div>
-                    <div class="stop-price-tag">$${stop.retail_price.toFixed(3)}/gal</div>
-                </div>
-                <div class="stop-meta">
-                    <i class="fa-solid fa-location-dot"></i> ${stop.address ? stop.address + ', ' : ''}${stop.city}, ${stop.state}
-                </div>
-                <div class="stop-stats">
-                    <span>Leg: <strong>${stop.leg_distance_miles.toFixed(1)} mi</strong></span>
-                    <span>Fuel: <strong>${stop.gallons_pumped.toFixed(1)} gal</strong></span>
-                    <span>Cost: <strong style="color: #86efac;">$${stop.cost_at_stop.toFixed(2)}</strong></span>
-                    <span>At Mile: <strong>${stop.route_mile.toFixed(0)}</strong></span>
-                </div>
-            `;
+                </li>`);
+        });
 
-            // Click card to zoom map into marker
-            card.addEventListener('click', () => {
-                const marker = stopMarkers[stop.stop_number];
-                if (marker) {
-                    map.setView(marker.getLatLng(), 11, { animate: true });
-                    marker.openPopup();
-                }
+        items.push(`<li class="connector" style="--i:${i++}">${miles(data.final_leg_miles)}</li>`);
+        items.push(`
+            <li style="--i:${i++}">
+                <div class="guide guide-finish">
+                    <div><span class="label">Destination</span><span class="place">${place(data.finish)}</span></div>
+                    <span class="dist">$${money(data.total_fuel_cost)}</span>
+                </div>
+            </li>`);
+
+        const list = $('itinerary');
+        list.innerHTML = items.join('');
+        list.querySelectorAll('.stop .sign').forEach((sign) => {
+            const number = Number(sign.closest('li').dataset.stop);
+            sign.addEventListener('click', () => focusStop(number));
+            sign.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); focusStop(number); }
             });
-
-            itineraryList.appendChild(card);
         });
     }
 
-    // 5. Event Listeners
-    routeForm.addEventListener('submit', (e) => {
+    function focusStop(number) {
+        const marker = stopMarkers[number];
+        if (!marker) return;
+        map.setView(marker.getLatLng(), 11, { animate: true });
+        marker.openPopup();
+        if (window.matchMedia('(max-width: 900px)').matches) {
+            $('map').scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+    }
+
+    // ---------- Events ----------
+    form.addEventListener('submit', (e) => {
         e.preventDefault();
-        calculateRoute(
-            startInput.value.trim(),
-            finishInput.value.trim(),
-            parseFloat(rangeInput.value) || 500.0,
-            parseFloat(mpgInput.value) || 10.0
-        );
+        calculateRoute();
     });
 
-    fitRouteBtn.addEventListener('click', fitRouteBounds);
+    rangeInput.addEventListener('input', () => {
+        const value = Math.round(parseFloat(rangeInput.value));
+        $('shieldNum').textContent = Number.isFinite(value) ? value : '—';
+    });
 
-    // Preset buttons
-    document.querySelectorAll('.preset-pill').forEach(btn => {
+    $('swapBtn').addEventListener('click', () => {
+        [startInput.value, finishInput.value] = [finishInput.value, startInput.value];
+    });
+
+    document.querySelectorAll('.preset').forEach((btn) => {
         btn.addEventListener('click', () => {
             startInput.value = btn.dataset.start;
             finishInput.value = btn.dataset.finish;
-            calculateRoute(
-                btn.dataset.start,
-                btn.dataset.finish,
-                parseFloat(rangeInput.value) || 500.0,
-                parseFloat(mpgInput.value) || 10.0
-            );
+            calculateRoute();
         });
     });
 
-    // Copy cURL button
-    copyCurlBtn.addEventListener('click', () => {
-        navigator.clipboard.writeText(curlCode.innerText).then(() => {
-            copyCurlBtn.innerHTML = '<i class="fa-solid fa-check"></i> Copied!';
-            setTimeout(() => {
-                copyCurlBtn.innerHTML = '<i class="fa-regular fa-copy"></i> Copy';
-            }, 2000);
-        });
+    $('fitRouteBtn').addEventListener('click', fitRoute);
+
+    $('copyCurlBtn').addEventListener('click', async () => {
+        const btn = $('copyCurlBtn');
+        try {
+            await navigator.clipboard.writeText($('curlCode').textContent);
+            btn.textContent = 'Copied ✓';
+        } catch {
+            btn.textContent = 'Copy failed';
+        }
+        setTimeout(() => { btn.textContent = 'Copy'; }, 1800);
     });
 
-    // Download Postman Collection
-    downloadPostmanBtn.addEventListener('click', () => {
-        window.open('/static/Fuel_Route_API.postman_collection.json', '_blank');
-    });
-
-    // Auto-calculate on initial load if inputs present
     if (startInput.value.trim() && finishInput.value.trim()) {
-        calculateRoute(
-            startInput.value.trim(),
-            finishInput.value.trim(),
-            parseFloat(rangeInput.value) || 500.0,
-            parseFloat(mpgInput.value) || 10.0
-        );
+        calculateRoute();
     }
 });
