@@ -1,0 +1,287 @@
+{
+  "info": {
+    "_postman_id": "c1f7b920-8e12-4293-8472-a9b1c7d2e4f0",
+    "name": "FuelPath AI - Optimal Fuel Routing API",
+    "description": "Production Postman Collection for demonstrating the Optimal Fuel Routing API in Django.\nComputes cost-effective fuel stops along routes in the USA using real OPIS retail fuel prices.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:8000",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Long Cross-Country Route (NY to LA - GET)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/route/?start=New York, NY&finish=Los Angeles, CA&max_range=500&mpg=10",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "route",
+            ""
+          ],
+          "query": [
+            {
+              "key": "start",
+              "value": "New York, NY",
+              "description": "Starting US location"
+            },
+            {
+              "key": "finish",
+              "value": "Los Angeles, CA",
+              "description": "Destination US location"
+            },
+            {
+              "key": "max_range",
+              "value": "500",
+              "description": "Vehicle maximum range in miles"
+            },
+            {
+              "key": "mpg",
+              "value": "10",
+              "description": "Vehicle fuel efficiency (10 mpg)"
+            }
+          ]
+        },
+        "description": "Computes optimal fuel stops for ~2,790 mile coast-to-coast route from New York to Los Angeles."
+      },
+      "response": []
+    },
+    {
+      "name": "2. Mid-Distance Route (Chicago to Miami - POST JSON)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"start\": \"Chicago, IL\",\n  \"finish\": \"Miami, FL\",\n  \"max_range\": 500,\n  \"mpg\": 10,\n  \"max_deviation_miles\": 10\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/route/",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "route",
+            ""
+          ]
+        },
+        "description": "Calculates fuel stops for ~1,380 mile route from Chicago, IL to Miami, FL using JSON POST body."
+      },
+      "response": []
+    },
+    {
+      "name": "3. West Coast Route (Seattle to San Diego - GET)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/route/?start=Seattle, WA&finish=San Diego, CA&max_range=500&mpg=10",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "route",
+            ""
+          ],
+          "query": [
+            {
+              "key": "start",
+              "value": "Seattle, WA"
+            },
+            {
+              "key": "finish",
+              "value": "San Diego, CA"
+            },
+            {
+              "key": "max_range",
+              "value": "500"
+            },
+            {
+              "key": "mpg",
+              "value": "10"
+            }
+          ]
+        },
+        "description": "Computes optimal fuel stops along the I-5 corridor on the West Coast (~1,255 miles)."
+      },
+      "response": []
+    },
+    {
+      "name": "4. Short Route (Austin to Dallas - Under 500 Miles Range)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/route/?start=Austin, TX&finish=Dallas, TX&max_range=500&mpg=10",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "route",
+            ""
+          ],
+          "query": [
+            {
+              "key": "start",
+              "value": "Austin, TX"
+            },
+            {
+              "key": "finish",
+              "value": "Dallas, TX"
+            },
+            {
+              "key": "max_range",
+              "value": "500"
+            },
+            {
+              "key": "mpg",
+              "value": "10"
+            }
+          ]
+        },
+        "description": "Demonstrates behavior for routes under 500 miles where 0 fuel stops are required to reach destination."
+      },
+      "response": []
+    },
+    {
+      "name": "5. Direct GPS Coordinates Route",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/route/?start=40.7128,-74.0060&finish=34.0522,-118.2437&max_range=500&mpg=10",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "route",
+            ""
+          ],
+          "query": [
+            {
+              "key": "start",
+              "value": "40.7128,-74.0060"
+            },
+            {
+              "key": "finish",
+              "value": "34.0522,-118.2437"
+            },
+            {
+              "key": "max_range",
+              "value": "500"
+            },
+            {
+              "key": "mpg",
+              "value": "10"
+            }
+          ]
+        },
+        "description": "Accepts direct lat,lon coordinate pairs."
+      },
+      "response": []
+    },
+    {
+      "name": "6. Search Fuel Stations Database",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/stations/?state=TX&limit=25",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "stations",
+            ""
+          ],
+          "query": [
+            {
+              "key": "state",
+              "value": "TX",
+              "description": "Filter by US state code"
+            },
+            {
+              "key": "limit",
+              "value": "25"
+            }
+          ]
+        },
+        "description": "Lists fuel stations loaded from OPIS dataset filtered by state."
+      },
+      "response": []
+    },
+    {
+      "name": "7. API Health Check",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/health/",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "health",
+            ""
+          ]
+        },
+        "description": "Verifies API and database connectivity."
+      },
+      "response": []
+    }
+  ]
+}
