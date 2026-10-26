@@ -686,9 +686,33 @@ body {
     padding-top: 6px;
 }
 
-/* Utilities */
-.hidden {
-    display: none !important;
+/* Leaflet Layer Switcher Dark Styling */
+.leaflet-control-layers {
+    background: rgba(17, 24, 39, 0.95) !important;
+    backdrop-filter: blur(12px) !important;
+    border: 1px solid rgba(255, 255, 255, 0.12) !important;
+    border-radius: 12px !important;
+    color: #f9fafb !important;
+    box-shadow: var(--shadow-lg) !important;
+    font-family: var(--font-sans) !important;
+    font-size: 13px !important;
+    padding: 8px 12px !important;
+}
+
+.leaflet-control-layers-expanded {
+    color: #fff !important;
+}
+
+.leaflet-control-layers-base label {
+    display: flex !important;
+    align-items: center !important;
+    gap: 8px !important;
+    margin-bottom: 6px !important;
+    cursor: pointer !important;
+}
+
+.leaflet-control-layers-base label:last-child {
+    margin-bottom: 0 !important;
 }
 
 /* Responsive adjustments */
@@ -705,3 +729,4 @@ body {
         height: 45vh;
     }
 }
+

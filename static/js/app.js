@@ -14,12 +14,32 @@ document.addEventListener('DOMContentLoaded', () => {
     // Add zoom control at bottom right
     L.control.zoom({ position: 'bottomright' }).addTo(map);
 
-    // Add clean, high-performance map tiles (CartoDB Voyager)
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+    // 100% Free OpenStreetMap & Esri basemap layers (Zero API key required, no watermarks)
+    const osmStandard = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
         maxZoom: 19,
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
-        subdomains: 'abcd',
-    }).addTo(map);
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a> contributors'
+    });
+
+    const esriDark = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}', {
+        maxZoom: 16,
+        attribution: 'Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ'
+    });
+
+    const esriStreets = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', {
+        maxZoom: 19,
+        attribution: 'Tiles &copy; Esri &mdash; Source: Esri, DeLorme, NAVTEQ, USGS'
+    });
+
+    // Default to OpenStreetMap Standard
+    osmStandard.addTo(map);
+
+    // Layer switcher control (top-right)
+    const baseLayers = {
+        "🗺️ OpenStreetMap": osmStandard,
+        "🌙 Dark Mode": esriDark,
+        "🛣️ Streets": esriStreets
+    };
+    L.control.layers(baseLayers, null, { position: 'topright' }).addTo(map);
 
     // Layer groups for dynamic map elements
     let routeLayer = null;
